@@ -1,0 +1,88 @@
+# self.llamolotl CI — yard-native inference image build.
+#
+# Reshaped from the pre-shipyard podman/GPU-runner CI to the yard convention:
+# kaniko on the `bigbuild` runner -> container.home (same as self.ai / self.chat
+# / self.finance).
+#
+# Two images. The full dual-purpose image (Dockerfile: llama.cpp serving +
+# HF Trainer/DeepSpeed/PEFT training-api under supervisord) is now canonical and
+# owns `:latest` + `:<sha>` (self.ai's llamolotl deployment tracks :latest). The
+# serving-only image (Dockerfile.llama-only) is kept but demoted to
+# `:llama-only-latest` / `:llama-only-<sha>`.
+#
+# GPU/CUDA: the build is GPU-less (stub libs, GGML_NATIVE=OFF). The image pins
+# CUDA 13.1, which runs on nidavellir's driver 580.105.08 / CUDA 13.0 via CUDA
+# minor-version forward-compatibility (same major 13). Target GPU is the RTX
+# 4090 (sm_89, Ada).
+#
+# self.llama (llama.cpp source) is a submodule with a relative URL
+# (../self.llama.git); recursive + force-https resolves it via CI_JOB_TOKEN.
+
+stages: [build, publish]
+
+include:
+  - project: 'selfshipyard/selfai/self.ai'
+    ref: main
+    file: '.gitlab/ci-templates/sync-public-alpha.yml'
+
+default:
+  tags: [bigbuild]
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_FORCE_HTTPS: "true"
+  IMAGE: $CI_REGISTRY_IMAGE
+
+# --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
+# GIT_SUBMODULE_STRATEGY: none — the sync job only archives/filters the tree,
+# doesn't need self.llama checked out.
+sync:public-alpha:
+  extends: .sync-public-alpha
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    MIRROR_EXCLUDE_PATHS: "context"
+
+build:llama-server:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  timeout: 2h
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  script:
+    - test -f self.llama/CMakeLists.txt || { echo "FATAL self.llama submodule missing — check GIT_SUBMODULE_STRATEGY"; exit 1; }
+    - >
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile Dockerfile.llama-only
+      --cache=true --cache-repo "$IMAGE/cache"
+      --destination "$IMAGE:llama-only-$CI_COMMIT_SHORT_SHA"
+      --destination "$IMAGE:llama-only-latest"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+build:training:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  timeout: 4h
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  script:
+    - test -f self.llama/CMakeLists.txt || { echo "FATAL self.llama submodule missing — check GIT_SUBMODULE_STRATEGY"; exit 1; }
+    - >
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile Dockerfile
+      --cache=true --cache-repo "$IMAGE/cache"
+      --destination "$IMAGE:$CI_COMMIT_SHORT_SHA"
+      --destination "$IMAGE:latest"
+      --destination "$IMAGE:training-$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'

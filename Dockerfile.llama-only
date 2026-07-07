@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.5
+# Minimal llama.cpp + CUDA build for debugging
+
+ARG CUDA_VERSION=13.1.0
+ARG UBUNTU_VERSION=22.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake git libssl-dev libgomp1 && \
+    rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
+
+WORKDIR /llama-src
+COPY self.llama/ .
+
+# === VERBOSE DEBUG OUTPUT ===
+RUN set -x && \
+    echo "========== CUDA ENVIRONMENT ==========" && \
+    which nvcc && \
+    nvcc --version && \
+    echo "========== CUDA LIBRARY PATHS ==========" && \
+    ls -lah /usr/local/cuda/lib64/ | grep -E "libcuda|libcudart" && \
+    echo "========== CUDA STUBS ==========" && \
+    ls -lah /usr/local/cuda/lib64/stubs/ 2>&1 || echo "No stubs directory" && \
+    echo "========== LD_LIBRARY_PATH ==========" && \
+    echo "$LD_LIBRARY_PATH" && \
+    echo "========== CMAKE VERSION ==========" && \
+    cmake --version && \
+    echo "========== STARTING CMAKE CONFIGURE ==========" && \
+    set +x
+
+# Run cmake with explicit stub linking via environment
+RUN export LDFLAGS="-L/usr/local/cuda/lib64/stubs $LDFLAGS" && \
+    cmake -B build \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CUDA=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_VERBOSE_MAKEFILE=ON \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined" \
+      --debug-output \
+      . 2>&1
+
+RUN echo "========== CMAKE BUILD OUTPUT ==========" && \
+    export LDFLAGS="-L/usr/local/cuda/lib64/stubs $LDFLAGS" && \
+    cmake --build build --config Release -j$(nproc) 2>&1
+
+RUN echo "========== CHECKING BUILD ARTIFACTS ==========" && \
+    ls -lah build/bin/ && \
+    echo "========== CHECKING LLAMA-SERVER DEPENDENCIES ==========" && \
+    ldd build/bin/llama-server 2>&1 || echo "ldd failed - checking nm instead" && \
+    nm build/bin/llama-server | grep -i cuda | head -20
+
+RUN mkdir -p /app/lib && \
+    cp build/bin/llama-server /app/llama-server && \
+    cp build/bin/llama-bench /app/llama-bench && \
+    # llama.cpp builds shared libs (libllama, libggml*, libmtmd); the binaries
+    # link them at runtime. Carry them into the runtime image (-P keeps the
+    # versioned .so symlinks).
+    cp -P build/bin/*.so* /app/lib/ && \
+    ls -lah /app/lib/
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+
+# Runtime deps the cuda-runtime base lacks (the devel base/build stage had them):
+# libgomp1 = OpenMP (ggml-cpu), libssl3 = httplib TLS, libcurl4 = model fetch,
+# ca-certificates for outbound TLS.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 libssl3 libcurl4 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# The CUDA forward-compat libs (/usr/local/cuda/compat) only work on data-center
+# GPUs; on a GeForce 4090 they make CUDA init fail ("forward compatibility was
+# attempted on non supported HW") and llama-server silently runs on CPU.
+# Removing them from LD_LIBRARY_PATH isn't enough — they're on the ldconfig path
+# too — so delete the dir. The CUDA 13.1 runtime then uses the host driver's
+# libcuda (13.0, mounted by the nvidia container runtime) via CUDA minor-version
+# compatibility, and the GPU is used.
+RUN rm -rf /usr/local/cuda/compat && ldconfig
+
+RUN echo "========== RUNTIME ENVIRONMENT ==========" && \
+    ls -lah /usr/local/cuda/lib64/ | grep -E "libcuda|libcudart"
+
+COPY --from=0 /app/llama-server /app/llama-server
+COPY --from=0 /app/llama-bench /app/llama-bench
+COPY --from=0 /app/lib /app/lib
+
+ENV LD_LIBRARY_PATH=/app/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+WORKDIR /app
+
+RUN echo "========== FINAL CHECK ==========" && \
+    ldd /app/llama-server 2>&1 || echo "ldd failed"
+
+CMD ["/app/llama-server", "--help"]

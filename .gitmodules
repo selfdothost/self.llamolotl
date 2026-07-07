@@ -1,0 +1,3 @@
+[submodule "self.llama"]
+	path = self.llama
+	url = ../self.llama.git

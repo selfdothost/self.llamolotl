@@ -1,0 +1,15 @@
+# Claude Code local state
+.claude/settings.local.json
+.claude/ralph-loop.local.md
+.claude/*.local.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
