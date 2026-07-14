@@ -123,14 +123,42 @@ RUN pip install --no-cache-dir flash-attn 2>/dev/null || \
     pip cache purge
 
 # Core training stack: HF Trainer + DeepSpeed + PEFT + TRL
+#
+# Pinned (self.llamolotl#13) — this stack moves fast and breaks APIs on
+# unpinned rebuilds (transformers/trl/peft/accelerate especially). Versions
+# below are verified two ways: (1) PyPI release metadata cross-checked so
+# every package's own declared dependency range is mutually satisfiable
+# (trl>=1.6.0 needs transformers>=4.56.2/accelerate>=1.4.0/datasets>=4.7.0,
+# peft/accelerate/bitsandbytes all resolve against torch==${PYTORCH_VERSION}
+# from the ARG above); (2) a `pip install --dry-run --report` resolve of
+# this exact list completed the full dependency graph with no conflicts
+# (torch itself aside — that pin is fixed separately via PYTORCH_VERSION).
+# Versions are also deliberately a few weeks behind the bleeding edge
+# (not "latest as of today") to avoid pinning a same-day release with no
+# soak time. Also confirmed against api/train.py's actual usage:
+# `dtype=` kwarg on AutoModelForCausalLM.from_pretrained (not the
+# deprecated `torch_dtype=`), and SFTTrainer's `processing_class=`/
+# `peft_config=` + SFTConfig's `max_length=`/`packing=`/
+# `dataset_text_field=` — all present in transformers>=4.56 and
+# trl>=1.6.0's source.
+#
+# fastapi/uvicorn/aiofiles/gguf/pyyaml/scipy/sentencepiece/protobuf/aiohttp
+# aren't the fast-breaking ML libs this issue is about, but are pinned too
+# for reproducibility; picked from each package's recent-but-not-same-day
+# stable release (verified via PyPI release history only, not exercised
+# against this repo's code — no version-sensitive API usage of these found
+# in api/ or train.py).
+#
+# PyJWT is intentionally left unpinned here — it's self.llamolotl#12's
+# auth/ticket dependency, out of scope for this pin sweep and touched by a
+# concurrent change elsewhere in the repo.
 RUN pip install --no-cache-dir \
-        transformers peft trl accelerate datasets \
-        bitsandbytes mpi4py \
-        fastapi "uvicorn[standard]" aiofiles gguf \
-        pyyaml scipy sentencepiece protobuf aiohttp && \
+        transformers==5.12.1 peft==0.19.1 trl==1.6.0 accelerate==1.14.0 datasets==5.0.0 \
+        bitsandbytes==0.49.2 mpi4py==4.1.2 \
+        fastapi==0.138.2 "uvicorn[standard]==0.49.0" aiofiles==25.1.0 gguf==0.19.0 \
+        pyyaml==6.0.3 scipy==1.17.1 sentencepiece==0.2.1 protobuf==7.35.1 aiohttp==3.14.1 \
+        PyJWT && \
     pip cache purge
-
-# Heretic: abliteration / censorship removal tool for research
 
 # DeepSpeed: install with CUDA check skipped (13.1 system vs 13.0 torch — minor,
 # forward-compatible). Pre-build CPU Adam op so no JIT compilation needed at runtime.
@@ -159,6 +187,16 @@ RUN apt-get update && \
     rm -rf /var/cache/apt/archives && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /tmp/* /var/tmp/*
+
+# The CUDA forward-compat libs (/usr/local/cuda/compat) only work on data-center
+# GPUs; on a GeForce 4090 they make CUDA init fail ("forward compatibility was
+# attempted on non supported HW") and llama-server silently runs on CPU.
+# Removing them from LD_LIBRARY_PATH isn't enough — they're on the ldconfig path
+# too — so delete the dir. The CUDA 13.1 runtime then uses the host driver's
+# libcuda (13.0, mounted by the nvidia container runtime) via CUDA minor-version
+# compatibility, and the GPU is used. Mirrors the existing fix in
+# Dockerfile.llama-only (this is the production Dockerfile, self.llamolotl#10).
+RUN rm -rf /usr/local/cuda/compat && ldconfig
 
 # Create supervisor log directory
 RUN mkdir -p /var/log/supervisor

@@ -6,11 +6,68 @@ Run: docker exec self-llamolotl python -m pytest /workspace/training/api/tests/ 
 """
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def reset_liveness_heartbeat():
+    """Keep the /health/live job-poll heartbeat from leaking between tests.
+
+    Tests that exercise liveness (test_system.py::TestLivenessReadiness)
+    mutate api.state._last_poll_heartbeat directly to simulate a fresh or
+    stale background poll loop. Reset it to "just ticked" before and after
+    each test so an earlier test's stale value can't bleed into an unrelated
+    test that happens to hit /health/live.
+    """
+    import api.state as state
+
+    state._last_poll_heartbeat = time.monotonic()
+    yield
+    state._last_poll_heartbeat = time.monotonic()
+
+# Test-only HMAC secret for the service-ticket auth layer (self.llamolotl#12).
+# Never used outside pytest — real deployments get SERVICE_AUTH_SECRET from
+# the selfai-service-auth ExternalSecret.
+TEST_SERVICE_AUTH_SECRET = "pytest-only-service-auth-secret"
+TEST_SERVICE_AUTH_AUDIENCE = "self.llamolotl"
+
+# Every scope this API currently gates, so the default `client` fixture can
+# hit any endpoint without individual tests needing to know about scopes —
+# scope enforcement itself is covered separately in test_auth.py.
+ALL_SCOPES = (
+    "models:read models:pull models:delete models:write "
+    "system:read system:write system:restart "
+    "jobs:read jobs:write jobs:create "
+    "pipeline:read pipeline:write"
+)
+
+
+def mint_test_ticket(
+    scope=ALL_SCOPES,
+    audience=TEST_SERVICE_AUTH_AUDIENCE,
+    secret=TEST_SERVICE_AUTH_SECRET,
+    ttl_seconds=120,
+    **extra_claims,
+):
+    """Mint a service ticket signed with the pytest test secret. Mirrors
+    self.ai's minting side (api/selfai_ui/utils/service_auth.py) closely
+    enough to exercise the same validation path as production."""
+    now = int(time.time())
+    payload = {
+        "iss": "self.ai",
+        "aud": audience,
+        "scope": scope,
+        "iat": now,
+        "exp": now + ttl_seconds,
+    }
+    payload.update(extra_claims)
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 @pytest.fixture
@@ -99,6 +156,24 @@ def patched_state(temp_workspace):
 
 @pytest.fixture
 def client(patched_state):
-    """Provide a FastAPI TestClient with patched state."""
+    """Provide a FastAPI TestClient with patched state and a valid,
+    all-scopes service ticket attached by default.
+
+    These tests exercise business logic, not the auth layer itself — scope/
+    expiry/audience enforcement is covered in test_auth.py. Patching
+    api.auth.SERVICE_AUTH_SECRET here (rather than leaving it unset) also
+    means a missing-secret misconfiguration can't accidentally make these
+    tests pass by having every route 503 in a way that looks like success.
+    """
+    import api.auth as auth_module
+
+    original_secret = auth_module.SERVICE_AUTH_SECRET
+    auth_module.SERVICE_AUTH_SECRET = TEST_SERVICE_AUTH_SECRET
+
     from api.main import app
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers.update({auth_module.TICKET_HEADER: mint_test_ticket()})
+
+    yield c
+
+    auth_module.SERVICE_AUTH_SECRET = original_secret

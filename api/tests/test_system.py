@@ -63,9 +63,37 @@ class TestHealthEndpoint:
 class TestLivenessReadiness:
     """Test liveness and readiness probes."""
 
-    def test_liveness_always_alive(self, client):
-        """GET /health/live always returns alive."""
+    def test_liveness_alive_when_heartbeat_fresh(self, client):
+        """GET /health/live returns alive when the job-poll heartbeat is fresh."""
+        import api.state as state
+        import time
+
+        state._last_poll_heartbeat = time.monotonic()
         resp = client.get("/health/live")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "alive"
+
+    def test_liveness_unhealthy_when_heartbeat_stale(self, client):
+        """GET /health/live returns 503 when the job-poll loop has gone stale
+        (event loop wedged or the background task died) — this is the real
+        signal a k8s livenessProbe should act on."""
+        import api.state as state
+        import time
+
+        state._last_poll_heartbeat = time.monotonic() - 3600
+        resp = client.get("/health/live")
+        assert resp.status_code == 503
+        assert "stale" in resp.json()["detail"]
+
+    def test_liveness_independent_of_inference_health(self, client):
+        """GET /health/live stays alive even if llama-server is down — that's
+        /health/ready's job, not liveness's (see cavekit-inference.md R5)."""
+        import api.state as state
+        import time
+
+        state._last_poll_heartbeat = time.monotonic()
+        with patch("api.routers.system._check_inference_health", return_value=(False, None)):
+            resp = client.get("/health/live")
         assert resp.status_code == 200
         assert resp.json()["status"] == "alive"
 

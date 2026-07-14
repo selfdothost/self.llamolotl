@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Dict, List
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from ..auth import require_scope
 from ..state import (
     BAKE_SCRIPT,
     CONVERT_HF_TO_GGUF,
@@ -56,7 +57,7 @@ router = APIRouter()
 # ─── Pipeline Endpoints ───────────────────────────────────────────────
 
 @router.post("/api/pipeline/pull-hf-model")
-async def pull_hf_model(req: HfModelPullRequest):
+async def pull_hf_model(req: HfModelPullRequest, _auth=Depends(require_scope("pipeline:write"))):
     """Download a full HuggingFace model (safetensors, config, tokenizer) for
     use in the convert-to-gguf pipeline.
 
@@ -239,7 +240,7 @@ async def pull_hf_model(req: HfModelPullRequest):
 
 
 @router.post("/api/pipeline/merge-lora", status_code=201)
-def merge_lora(req: MergeLoraRequest) -> PipelineTask:
+def merge_lora(req: MergeLoraRequest, _auth=Depends(require_scope("pipeline:write"))) -> PipelineTask:
     """Merge a LoRA/QLoRA adapter into the base model.
 
     Uses PEFT to load the adapter and merge it into the base model.
@@ -294,7 +295,7 @@ def merge_lora(req: MergeLoraRequest) -> PipelineTask:
 
 
 @router.post("/api/pipeline/convert-to-gguf", status_code=201)
-def convert_to_gguf(req: ConvertToGgufRequest) -> PipelineTask:
+def convert_to_gguf(req: ConvertToGgufRequest, _auth=Depends(require_scope("pipeline:write"))) -> PipelineTask:
     """Convert a HuggingFace-format model (safetensors) to GGUF format.
 
     The resulting GGUF file is placed in MODELS_DIR ready for llama-server.
@@ -371,7 +372,7 @@ def convert_to_gguf(req: ConvertToGgufRequest) -> PipelineTask:
 
 
 @router.post("/api/pipeline/quantize", status_code=201)
-def quantize_model(req: QuantizeRequest) -> PipelineTask:
+def quantize_model(req: QuantizeRequest, _auth=Depends(require_scope("pipeline:write"))) -> PipelineTask:
     """Quantize a GGUF model to a smaller format.
 
     Takes an existing GGUF file in MODELS_DIR and produces a quantized version.
@@ -431,7 +432,7 @@ def quantize_model(req: QuantizeRequest) -> PipelineTask:
 
 
 @router.post("/api/pipeline/convert-lora-to-gguf", status_code=201)
-def convert_lora_to_gguf(req: ConvertLoraToGgufRequest) -> PipelineTask:
+def convert_lora_to_gguf(req: ConvertLoraToGgufRequest, _auth=Depends(require_scope("pipeline:write"))) -> PipelineTask:
     """Convert a LoRA adapter to GGUF format for dynamic loading with llama-server.
 
     The resulting LoRA GGUF can be applied at inference time via /api/system/apply-loras
@@ -508,7 +509,7 @@ def convert_lora_to_gguf(req: ConvertLoraToGgufRequest) -> PipelineTask:
 
 
 @router.get("/api/loras/available")
-def list_available_loras():
+def list_available_loras(_auth=Depends(require_scope("pipeline:read"))):
     """List LoRA GGUF files available for dynamic loading.
 
     Returns LoRAs from models_meta.json (source_type == lora_gguf) that
@@ -622,7 +623,7 @@ def list_available_loras():
 
 
 @router.post("/api/pipeline/bake", status_code=201)
-def bake_model(req: BakeRequest) -> PipelineTask:
+def bake_model(req: BakeRequest, _auth=Depends(require_scope("pipeline:write"))) -> PipelineTask:
     """Bake multiple LoRA adapters into a single GGUF model.
 
     This is the full pipeline: merge LoRAs with weights -> convert to GGUF -> quantize.
@@ -717,13 +718,13 @@ def bake_model(req: BakeRequest) -> PipelineTask:
 
 
 @router.get("/api/pipeline/tasks")
-def list_pipeline_tasks() -> List[PipelineTask]:
+def list_pipeline_tasks(_auth=Depends(require_scope("pipeline:read"))) -> List[PipelineTask]:
     """List all pipeline tasks."""
     return sorted(_pipeline_tasks.values(), key=lambda t: t.created_at, reverse=True)
 
 
 @router.get("/api/pipeline/tasks/{task_id}")
-def get_pipeline_task(task_id: str) -> PipelineTask:
+def get_pipeline_task(task_id: str, _auth=Depends(require_scope("pipeline:read"))) -> PipelineTask:
     """Get pipeline task details."""
     task = _pipeline_tasks.get(task_id)
     if not task:
@@ -733,7 +734,10 @@ def get_pipeline_task(task_id: str) -> PipelineTask:
 
 @router.get("/api/pipeline/tasks/{task_id}/logs")
 async def get_pipeline_task_logs(
-    task_id: str, tail: int = Query(100), stream: bool = Query(False)
+    task_id: str,
+    tail: int = Query(100),
+    stream: bool = Query(False),
+    _auth=Depends(require_scope("pipeline:read")),
 ):
     """Get pipeline task logs."""
     task = _pipeline_tasks.get(task_id)
@@ -774,7 +778,7 @@ async def get_pipeline_task_logs(
 
 
 @router.delete("/api/pipeline/tasks/{task_id}")
-def cancel_pipeline_task(task_id: str):
+def cancel_pipeline_task(task_id: str, _auth=Depends(require_scope("pipeline:write"))):
     """Cancel a running pipeline task."""
     task = _pipeline_tasks.get(task_id)
     if not task:

@@ -1,0 +1,53 @@
+self.llamolotl
+Copyright (C) 2026 selfdothost / the self.ai contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 3, as published by the Free
+Software Foundation. The full text is in LICENSE.
+
+--------------------------------------------------------------------------------
+Provenance & retained upstream notice — self.llama/
+--------------------------------------------------------------------------------
+
+self.llama/ is a fully vendored, unmodified tree of llama.cpp
+(https://github.com/ggml-org/llama.cpp), pinned at upstream commit
+699bb0e95b1befd66c64456193a0dd958a96455e, originally licensed MIT. It was
+previously carried as a separate GitLab project (selfshipyard/selfai/self.llama)
+and consumed here via a git submodule; that indirection bought nothing (zero
+yard commits on top of upstream, no independent issues) and caused real build
+friction (empty/uninitialized checkouts, submodule-init pain in CI), so it was
+folded in directly as a vendored subdirectory, matching how every other
+upstream dependency in this subgroup (self.code-eval, self.language-eval,
+self.curator, self.faster-whisper) is vendored.
+
+Why fully vendored: self.ai licenses the combined work under GPLv3. MIT is
+one-way compatible with GPLv3, so the upstream code is included here under
+GPLv3 while its original MIT license text and attribution are retained in
+LICENSE.llama-cpp-mit. A GPLv3 combined work cannot be contributed back to an
+MIT upstream, so self.llama/ is a hard vendor: we do not track or push to the
+original project. self.llamolotl is not affiliated with, endorsed by, or
+connected to the ggml-org/llama.cpp project.
+
+Removed from the vendored tree (all confirmed unreferenced by
+tools/server/CMakeLists.txt and every other build step this repo actually
+uses — self.chat is the yard's own chat frontend, none of this UI code serves
+any purpose here):
+- tools/server/webui/ — full source of llama-server's built-in web UI
+- tools/server/public_legacy/, tools/server/public_simplechat/ — older/alternate
+  UI variants
+- tools/server/themes/ — theme variants for the above
+- tools/server/bench/ — a standalone Python load-testing script (unrelated to
+  the tools/llama-bench/ binary, which self.llamolotl's Dockerfile does use
+  and keeps)
+- tools/server/chat-llama2.sh, chat.sh, chat.mjs — unused CLI example scripts
+
+Kept: tools/server/public/index.html.gz and loading.html, the two assets
+CMakeLists.txt actually embeds into the llama-server binary. The served
+webui route is disabled at runtime today (LLAMA_ARG_WEBUI=false in the Flux
+deployment) but the assets are still compiled in; fully stripping them
+requires editing tools/server/server-http.cpp's routing logic directly
+(not just CMakeLists.txt), which is real llama.cpp-internal source surgery —
+deliberately deferred as separate follow-up work rather than risked here.
+See selfshipyard/selfai/self.llamolotl#8.
+
+The original MIT license text is preserved verbatim in LICENSE.llama-cpp-mit.

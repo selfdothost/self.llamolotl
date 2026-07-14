@@ -15,8 +15,9 @@
 # minor-version forward-compatibility (same major 13). Target GPU is the RTX
 # 4090 (sm_89, Ada).
 #
-# self.llama (llama.cpp source) is a submodule with a relative URL
-# (../self.llama.git); recursive + force-https resolves it via CI_JOB_TOKEN.
+# self.llama/ (llama.cpp source) is a vendored subdirectory (folded in from
+# the former self.llama submodule, self.llamolotl#8) -- plain tracked files,
+# no submodule init/fetch step needed.
 
 stages: [build, publish]
 
@@ -29,17 +30,12 @@ default:
   tags: [bigbuild]
 
 variables:
-  GIT_SUBMODULE_STRATEGY: recursive
-  GIT_SUBMODULE_FORCE_HTTPS: "true"
   IMAGE: $CI_REGISTRY_IMAGE
 
 # --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
-# GIT_SUBMODULE_STRATEGY: none — the sync job only archives/filters the tree,
-# doesn't need self.llama checked out.
 sync:public-alpha:
   extends: .sync-public-alpha
   variables:
-    GIT_SUBMODULE_STRATEGY: none
     MIRROR_EXCLUDE_PATHS: "context"
 
 build:llama-server:
@@ -52,7 +48,6 @@ build:llama-server:
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
   script:
-    - test -f self.llama/CMakeLists.txt || { echo "FATAL self.llama submodule missing — check GIT_SUBMODULE_STRATEGY"; exit 1; }
     - >
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
@@ -74,7 +69,6 @@ build:training:
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
   script:
-    - test -f self.llama/CMakeLists.txt || { echo "FATAL self.llama submodule missing — check GIT_SUBMODULE_STRATEGY"; exit 1; }
     - >
       /kaniko/executor
       --context "$CI_PROJECT_DIR"

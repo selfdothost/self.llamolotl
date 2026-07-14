@@ -12,9 +12,10 @@ from typing import Dict, List, Optional
 
 import aiofiles
 import yaml
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from ..auth import require_scope
 from ..state import (
     CONFIGS_DIR,
     DATASETS_DIR,
@@ -55,7 +56,7 @@ def _build_override_args(overrides: Optional[Dict]) -> List[str]:
 # ─── Jobs Endpoints ────────────────────────────────────────────────────
 
 @router.post("/api/jobs", status_code=201)
-def create_job(req: JobCreate) -> Job:
+def create_job(req: JobCreate, _auth=Depends(require_scope("jobs:create"))) -> Job:
     """Queue a new training job. It will start automatically when no other job is running."""
     # Validate config input
     if not req.config_path and not req.config_inline:
@@ -134,7 +135,7 @@ def create_job(req: JobCreate) -> Job:
 
 
 @router.get("/api/jobs")
-def list_jobs() -> List[Job]:
+def list_jobs(_auth=Depends(require_scope("jobs:read"))) -> List[Job]:
     """List all jobs."""
     for job in _jobs.values():
         if job.status == JobStatus.RUNNING:
@@ -143,7 +144,7 @@ def list_jobs() -> List[Job]:
 
 
 @router.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> Job:
+def get_job(job_id: str, _auth=Depends(require_scope("jobs:read"))) -> Job:
     """Get job details."""
     job = _jobs.get(job_id)
     if not job:
@@ -155,7 +156,10 @@ def get_job(job_id: str) -> Job:
 
 @router.get("/api/jobs/{job_id}/logs")
 async def get_job_logs(
-    job_id: str, tail: int = Query(100), stream: bool = Query(False)
+    job_id: str,
+    tail: int = Query(100),
+    stream: bool = Query(False),
+    _auth=Depends(require_scope("jobs:read")),
 ):
     """Get job logs."""
     job = _jobs.get(job_id)
@@ -199,7 +203,7 @@ async def get_job_logs(
 
 
 @router.delete("/api/jobs/{job_id}")
-def cancel_job(job_id: str):
+def cancel_job(job_id: str, _auth=Depends(require_scope("jobs:write"))):
     """Cancel a running job."""
     import subprocess
 
@@ -226,7 +230,7 @@ def cancel_job(job_id: str):
 
 
 @router.post("/api/jobs/{job_id}/approve")
-def approve_job(job_id: str):
+def approve_job(job_id: str, _auth=Depends(require_scope("jobs:write"))):
     """Approve a pending job so it can be started."""
     job = _jobs.get(job_id)
     if not job:
@@ -248,7 +252,7 @@ def approve_job(job_id: str):
 # ─── Config Endpoints ──────────────────────────────────────────────────
 
 @router.post("/api/configs", status_code=201)
-def create_config(req: ConfigCreate):
+def create_config(req: ConfigCreate, _auth=Depends(require_scope("jobs:write"))):
     """Save a new config file."""
     # Validate name
     if not req.name or "/" in req.name or "\\" in req.name:
@@ -270,7 +274,7 @@ def create_config(req: ConfigCreate):
 
 
 @router.post("/api/datasets", status_code=201)
-def upload_dataset(req: DatasetUploadRequest):
+def upload_dataset(req: DatasetUploadRequest, _auth=Depends(require_scope("jobs:write"))):
     """Save a local training dataset (JSONL) pushed by the API.
 
     Returns the absolute path the trainer should reference in its dataset
@@ -295,7 +299,7 @@ def upload_dataset(req: DatasetUploadRequest):
 
 
 @router.get("/api/configs")
-def list_configs():
+def list_configs(_auth=Depends(require_scope("jobs:read"))):
     """List all saved configs."""
     configs = []
     for path in sorted(CONFIGS_DIR.glob("*.yaml")):
@@ -311,7 +315,7 @@ def list_configs():
 
 
 @router.get("/api/configs/{config_name}")
-def get_config(config_name: str):
+def get_config(config_name: str, _auth=Depends(require_scope("jobs:read"))):
     """Get config content."""
     config_path = _validate_path(config_name, CONFIGS_DIR, suffix=".yaml")
     if not config_path.exists():
@@ -320,7 +324,7 @@ def get_config(config_name: str):
 
 
 @router.delete("/api/configs/{config_name}")
-def delete_config(config_name: str):
+def delete_config(config_name: str, _auth=Depends(require_scope("jobs:write"))):
     """Delete a config."""
     config_path = _validate_path(config_name, CONFIGS_DIR, suffix=".yaml")
     if not config_path.exists():
@@ -343,7 +347,7 @@ def delete_config(config_name: str):
 # ─── Outputs Endpoint ──────────────────────────────────────────────────
 
 @router.get("/api/outputs")
-def list_outputs():
+def list_outputs(_auth=Depends(require_scope("jobs:read"))):
     """List completed training output directories."""
     outputs = []
     if not OUTPUTS_DIR.exists():

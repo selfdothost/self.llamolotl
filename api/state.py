@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -283,6 +284,16 @@ _processes: Dict[str, subprocess.Popen] = {}
 _active_downloads: Dict[str, threading.Event] = {}  # name -> cancel event
 _pipeline_tasks: Dict[str, PipelineTask] = {}
 _pipeline_processes: Dict[str, subprocess.Popen] = {}
+
+# Max age (seconds) the job-poll heartbeat may reach before it's considered
+# stale by _check_api_liveness(). The loop ticks every 5s; this gives a
+# couple of missed ticks of slack before treating the process as wedged.
+_LIVENESS_MAX_HEARTBEAT_AGE = 30.0
+
+# Monotonic timestamp of the last _poll_jobs() loop iteration. Seeded at
+# import time so the process isn't falsely reported unhealthy before the
+# background task's first tick.
+_last_poll_heartbeat: float = time.monotonic()
 
 
 # ─── Path Safety ────────────────────────────────────────────────────────
@@ -786,6 +797,36 @@ def _restart_llama_server() -> dict:
 
 # ─── Health Check Helpers ────────────────────────────────────────────────
 
+def _check_api_liveness(max_age: float = _LIVENESS_MAX_HEARTBEAT_AGE) -> tuple:
+    """Check whether the training-api process itself is alive and unwedged.
+
+    Deliberately independent of llama-server's status — that's what
+    /health/ready checks. cavekit-inference.md R5 / cavekit-platform.md R4
+    both call for liveness (API process alive) and readiness (can it serve
+    inference) to be distinguished, not conflated. llama-server also already
+    has its own supervisord `autorestart=true` (supervisord.conf); tying this
+    endpoint's liveness to llama-server's state would make a k8s
+    livenessProbe kill and restart this whole pod for a sibling-process
+    crash that supervisord already self-heals, on top of what /health/ready
+    already reports for traffic-routing purposes.
+
+    Instead, this checks that the background job-poll loop (_poll_jobs, the
+    asyncio task started in main.py's lifespan) is still ticking. If the
+    event loop is wedged, or the poll task has died on an unhandled
+    exception, the heartbeat goes stale and this correctly reports
+    unhealthy — the actual condition a k8s livenessProbe exists to catch.
+
+    Returns (alive: bool, detail: str).
+    """
+    age = time.monotonic() - _last_poll_heartbeat
+    if age > max_age:
+        return False, (
+            f"job-poll loop heartbeat is {age:.1f}s stale (max {max_age:.0f}s) "
+            "— event loop may be wedged or the poll task has died"
+        )
+    return True, f"job-poll loop heartbeat {age:.1f}s ago"
+
+
 def _check_inference_health() -> tuple:
     """Probe llama-server health. Returns (healthy: bool, model: str|None)."""
     import urllib.request
@@ -813,16 +854,16 @@ def _check_gpu() -> tuple:
             line = result.stdout.strip().split("\n")[0]
             used_mb, total_mb = [float(x.strip()) for x in line.split(",")]
             return True, round(used_mb / 1024, 2), round(total_mb / 1024, 2)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log.debug("nvidia-smi GPU check failed, falling back to torch: %s", e)
     # Fallback to torch if nvidia-smi not available
     try:
         import torch
         if torch.cuda.is_available():
             total = torch.cuda.get_device_properties(0).total_mem / (1024**3)
             return True, None, round(total, 2)
-    except ImportError:
-        pass
+    except ImportError as e:
+        log.debug("torch not available for GPU check fallback: %s", e)
     return False, None, None
 
 
@@ -847,8 +888,10 @@ def _get_active_loras_from_server() -> list:
 
 async def _poll_jobs():
     """Background task: poll job status every 5 seconds and start pending jobs."""
+    global _last_poll_heartbeat
     while True:
         await asyncio.sleep(5)
+        _last_poll_heartbeat = time.monotonic()
         any_finished = False
         for job_id, job in list(_jobs.items()):
             if job.status != JobStatus.RUNNING:

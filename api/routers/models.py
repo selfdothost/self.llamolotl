@@ -11,10 +11,11 @@ import threading
 from pathlib import Path
 from typing import Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..auth import require_scope
 from ..state import (
     CONVERT_HF_TO_GGUF,
     CURATOR_CLASSIFIER_REPOS,
@@ -44,7 +45,7 @@ router = APIRouter()
 # ─── Models Endpoint ───────────────────────────────────────────────────
 
 @router.get("/api/models")
-def list_models():
+def list_models(_auth=Depends(require_scope("models:read"))):
     """List completed model outputs."""
     models = []
     if not OUTPUTS_DIR.exists():
@@ -79,7 +80,7 @@ def list_models():
 # ─── GGUF Model Management ────────────────────────────────────────────
 
 @router.get("/api/models/available")
-def list_available_models():
+def list_available_models(_auth=Depends(require_scope("models:read"))):
     """List GGUF model files in the models directory (recursive).
     Split GGUF shards are grouped: only the first shard is shown with the
     combined size of all parts."""
@@ -182,7 +183,7 @@ def list_available_models():
 
 
 @router.post("/api/models/register")
-def register_model(req: ModelRegisterRequest):
+def register_model(req: ModelRegisterRequest, _auth=Depends(require_scope("models:write"))):
     """Register a model in a subdirectory by symlinking its first shard
     to the top level of MODELS_DIR so llama-server can discover it."""
     model_path = (MODELS_DIR / req.name).resolve()
@@ -213,7 +214,7 @@ class ModelInspectRequest(BaseModel):
 
 
 @router.post("/api/models/inspect")
-async def inspect_model(req: ModelInspectRequest):
+async def inspect_model(req: ModelInspectRequest, _auth=Depends(require_scope("models:read"))):
     """Query HuggingFace for model file sizes before downloading."""
     from huggingface_hub import HfApi
 
@@ -265,7 +266,7 @@ async def inspect_model(req: ModelInspectRequest):
 
 
 @router.post("/api/models/pull")
-async def pull_model(req: ModelPullRequest):
+async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:pull"))):
     """Pull a GGUF model from HuggingFace. Streams progress as NDJSON."""
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -694,7 +695,7 @@ async def pull_model(req: ModelPullRequest):
 
 
 @router.post("/api/models/pull/cancel")
-def cancel_pull(req: ModelPullRequest):
+def cancel_pull(req: ModelPullRequest, _auth=Depends(require_scope("models:pull"))):
     """Cancel an active model download."""
     download_key = f"{req.name.strip()}/{req.filename or ''}"
     # Try exact match first, then prefix match
@@ -712,7 +713,7 @@ def cancel_pull(req: ModelPullRequest):
 
 
 @router.post("/api/models/delete")
-def delete_gguf_model(req: ModelDeleteRequest):
+def delete_gguf_model(req: ModelDeleteRequest, _auth=Depends(require_scope("models:delete"))):
     """Delete a GGUF model file from the models directory.
     If the file is part of a split GGUF set, all shards and symlinks are deleted."""
     raw_path = MODELS_DIR / req.name
@@ -788,7 +789,7 @@ def _is_repo_cached(repo_id: str, cache_dir: Path) -> bool:
 
 
 @router.post("/api/models/hf-cache/ensure")
-async def ensure_hf_cache(req: HfCacheEnsureRequest):
+async def ensure_hf_cache(req: HfCacheEnsureRequest, _auth=Depends(require_scope("models:pull"))):
     """Download HuggingFace model repos into the shared HF cache so the
     curator container can load them with local_files_only=True.
 
@@ -835,7 +836,7 @@ async def ensure_hf_cache(req: HfCacheEnsureRequest):
 
 
 @router.get("/api/models/hf-cache/status")
-async def hf_cache_status():
+async def hf_cache_status(_auth=Depends(require_scope("models:read"))):
     """Return cached/missing status for all curator classifier repos."""
     result = []
     for repo_id in CURATOR_CLASSIFIER_REPOS:
@@ -849,7 +850,7 @@ async def hf_cache_status():
 # ─── FastText Model Endpoints ────────────────────────────────────────
 
 @router.get("/api/models/fasttext/status")
-async def fasttext_model_status():
+async def fasttext_model_status(_auth=Depends(require_scope("models:read"))):
     """Return cached/missing status for the known FastText models."""
     result = []
     for model in CURATOR_FASTTEXT_MODELS:
@@ -864,7 +865,7 @@ async def fasttext_model_status():
 
 
 @router.post("/api/models/fasttext/ensure")
-async def ensure_fasttext_models():
+async def ensure_fasttext_models(_auth=Depends(require_scope("models:pull"))):
     """Download any missing FastText models into the shared HF cache volume.
 
     Streams NDJSON progress. Skips models that are already downloaded.

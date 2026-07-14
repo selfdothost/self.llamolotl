@@ -7,8 +7,9 @@ import logging
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from ..auth import require_scope
 from ..state import (
     API_VERSION,
     CHAT_TEMPLATE_OVERRIDE,
@@ -19,6 +20,7 @@ from ..state import (
     ChatTemplateUploadRequest,
     HealthResponse,
     JobStatus,
+    _check_api_liveness,
     _check_disk,
     _check_gpu,
     _check_inference_health,
@@ -35,7 +37,7 @@ router = APIRouter()
 # ─── llama-server Management ──────────────────────────────────────────
 
 @router.post("/api/system/restart-llama-server")
-def restart_llama_server():
+def restart_llama_server(_auth=Depends(require_scope("system:restart"))):
     """Restart llama-server to rescan models directory."""
     return _restart_llama_server()
 
@@ -43,7 +45,7 @@ def restart_llama_server():
 # ─── Chat Template Endpoints ─────────────────────────────────────────
 
 @router.post("/api/system/chat-template")
-async def upload_chat_template(req: ChatTemplateUploadRequest):
+async def upload_chat_template(req: ChatTemplateUploadRequest, _auth=Depends(require_scope("system:write"))):
     """Upload a custom Jinja2 chat template file.
 
     The template is stored and used via --chat-template-file on next server start.
@@ -57,7 +59,7 @@ async def upload_chat_template(req: ChatTemplateUploadRequest):
 
 
 @router.delete("/api/system/chat-template")
-def clear_chat_template():
+def clear_chat_template(_auth=Depends(require_scope("system:write"))):
     """Clear the custom chat template override, reverting to GGUF auto-detection."""
     if CHAT_TEMPLATE_OVERRIDE.exists():
         CHAT_TEMPLATE_OVERRIDE.unlink()
@@ -68,7 +70,7 @@ def clear_chat_template():
 
 
 @router.get("/api/system/chat-template")
-def get_chat_template():
+def get_chat_template(_auth=Depends(require_scope("system:read"))):
     """Return the current chat template override status."""
     if CHAT_TEMPLATE_OVERRIDE.exists():
         content = CHAT_TEMPLATE_OVERRIDE.read_text()
@@ -77,7 +79,7 @@ def get_chat_template():
 
 
 @router.get("/api/system/chat-templates/builtin")
-def list_builtin_templates():
+def list_builtin_templates(_auth=Depends(require_scope("system:read"))):
     """List available built-in chat template names."""
     # llama.cpp built-in templates (52 named templates)
     builtin = [
@@ -96,7 +98,7 @@ def list_builtin_templates():
 # ─── LoRA Management ─────────────────────────────────────────────────
 
 @router.post("/api/system/apply-loras")
-def apply_loras(req: ApplyLorasRequest):
+def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:write"))):
     """Set LoRA adapter scales at runtime via llama-server's native API.
 
     If all requested adapters are already preloaded, adjusts scales without restart.
@@ -177,7 +179,7 @@ def apply_loras(req: ApplyLorasRequest):
 
 
 @router.get("/api/system/active-loras")
-def get_active_loras():
+def get_active_loras(_auth=Depends(require_scope("system:read"))):
     """Return currently active LoRA adapters from llama-server's native API."""
     # Try native API first (live state)
     adapters = _get_active_loras_from_server()
@@ -221,6 +223,8 @@ def get_active_loras():
 
 
 # ─── Health Endpoints ─────────────────────────────────────────────────
+# Intentionally NOT behind require_scope: k8s readiness/liveness probes hit
+# these with no ticket, and they only reveal operational status, not control.
 
 @router.get("/health")
 def health() -> HealthResponse:
@@ -260,8 +264,23 @@ def health() -> HealthResponse:
 
 @router.get("/health/live")
 def health_liveness():
-    """Liveness probe — is the API process alive?"""
-    return {"status": "alive"}
+    """Liveness probe — is the training-api process itself alive and unwedged?
+
+    Checks the background job-poll loop's heartbeat (see
+    _check_api_liveness() in state.py for the full rationale). This is
+    intentionally independent of llama-server's status: that's what
+    /health/ready reports, and llama-server already has its own supervisord
+    autorestart. A stale heartbeat here means this process — not its
+    sibling — is actually stuck, which is what should trigger a pod restart.
+
+    Returns 503 (not 200 with a body flag) on failure so a k8s livenessProbe
+    wired to this endpoint actually observes it as a failed check.
+    """
+    alive, detail = _check_api_liveness()
+    if not alive:
+        log.error("Liveness check failed: %s", detail)
+        raise HTTPException(status_code=503, detail=detail)
+    return {"status": "alive", "detail": detail}
 
 
 @router.get("/health/ready")
