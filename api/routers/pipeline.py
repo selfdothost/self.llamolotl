@@ -140,13 +140,19 @@ async def pull_hf_model(req: HfModelPullRequest, _auth=Depends(require_scope("pi
 
             def download_task():
                 try:
-                    # Only download safetensors (skip .bin duplicates) + essential config/tokenizer files
+                    # Only download safetensors (skip .bin duplicates) + essential config/tokenizer files.
+                    # README.md is kept (not just cosmetic): convert_hf_to_gguf.py's Qwen3Model
+                    # detects rerank models by checking dir_model/README.md for "# Qwen3-Reranker" —
+                    # excluding it here silently produced a plain causal-LM GGUF (no classifier
+                    # tensor, no pooling_type=RANK, no rerank chat template) for every reranker ever
+                    # pulled through this endpoint, which then served garbage near-zero rerank scores.
                     allow_patterns = [
                         "*.safetensors",
                         "*.json",
                         "*.txt",          # e.g. merges.txt for tokenizer
                         "*.model",        # sentencepiece .model
                         "*.py",           # modeling code if needed
+                        "README.md",
                     ]
                     ignore_patterns = [
                         "*.gguf",
@@ -154,7 +160,6 @@ async def pull_hf_model(req: HfModelPullRequest, _auth=Depends(require_scope("pi
                         "*.msgpack",
                         "*.h5",
                         "*.ot",
-                        "*.md",
                         ".gitattributes",
                     ]
 

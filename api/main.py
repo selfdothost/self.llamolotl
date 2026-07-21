@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from . import integrity
 from .state import (
     API_VERSION,
     _ensure_dirs,
@@ -27,8 +28,12 @@ async def lifespan(app: FastAPI):
     _load_pipeline_tasks()
     _try_start_next_pending()
     poll_task = asyncio.create_task(_poll_jobs())
+    # Periodic /models integrity sweep (self.llamolotl#23) -- own interval,
+    # see integrity.run_periodic_sweep for why it's not folded into _poll_jobs.
+    integrity_task = asyncio.create_task(integrity.run_periodic_sweep())
     yield
     poll_task.cancel()
+    integrity_task.cancel()
 
 
 app = FastAPI(title="Training API", version=API_VERSION, lifespan=lifespan)

@@ -1,5 +1,6 @@
 import pytest
 import requests
+import threading
 import time
 import random
 
@@ -135,7 +136,7 @@ def test_completion_stream_with_openai_library_stops():
     client = OpenAI(api_key="dummy", base_url=f"http://{server.server_host}:{server.server_port}/v1")
     res = client.completions.create(
         model="davinci-002",
-        prompt="System: You are helpfull assistant.\nAssistant:\nHey! How could I help?\nUser:\nTell me a joke.\nAssistant:\n",
+        prompt="System: You are helpful assistant.\nAssistant:\nHey! How could I help?\nUser:\nTell me a joke.\nAssistant:\n",
         stop=["User:\n", "Assistant:\n"],
         max_tokens=200,
         stream=True,
@@ -491,29 +492,82 @@ def test_n_probs_post_sampling():
     global server
     server.start()
     res = server.make_request("POST", "/completion", data={
-        "prompt": "I believe the meaning of life is",
+        "prompt": "Today was the day. Today I would finally become a",
         "n_probs": 10,
-        "temperature": 0.0,
+        "temperature": 1.0,
         "n_predict": 5,
         "post_sampling_probs": True,
     })
     assert res.status_code == 200
     assert "completion_probabilities" in res.body
     assert len(res.body["completion_probabilities"]) == 5
-    for tok in res.body["completion_probabilities"]:
+    for (i, tok) in enumerate(res.body["completion_probabilities"]):
         assert "id" in tok and tok["id"] > 0
         assert "token" in tok and type(tok["token"]) == str
         assert "prob" in tok and 0.0 < tok["prob"] <= 1.0
         assert "bytes" in tok and type(tok["bytes"]) == list
-        assert len(tok["top_probs"]) == 10
+        assert "top_probs" in tok and type(tok["top_probs"]) == list
+
         for prob in tok["top_probs"]:
             assert "id" in prob and prob["id"] > 0
             assert "token" in prob and type(prob["token"]) == str
-            assert "prob" in prob and 0.0 <= prob["prob"] <= 1.0
+            # 0.0 probability tokens should never be returned by the server
+            assert "prob" in prob and 0.0 < prob["prob"] <= 1.0
             assert "bytes" in prob and type(prob["bytes"]) == list
-        # because the test model usually output token with either 100% or 0% probability, we need to check all the top_probs
-        assert any(prob["prob"] == 1.0 for prob in tok["top_probs"])
 
+        if i == 0:
+            # The prompt is vague enough that we should get at least 10 possibilities
+            # for the first token.
+            assert len(tok["top_probs"]) == 10
+
+        if len(tok["top_probs"]) < 10:
+            # Getting less than the requested number of probabilities should only happen
+            # if the ones we did get already sum to 1.0.
+            assert sum(p["prob"] for p in tok["top_probs"]) == pytest.approx(1.0)
+
+def test_n_probs_post_backend_sampling():
+    """Verify that the same probabilities are returned with and without backend sampling."""
+    global server
+    server.backend_sampling = True
+    server.start()
+
+    def make_request(backend_sampling):
+        n_predict = 20
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "The countries of Europe, in random order, are:",
+            "n_probs": 10,
+            "n_predict": n_predict,
+            "post_sampling_probs": True,
+            "seed": 4242,
+            "backend_sampling": backend_sampling,
+        })
+        assert res.status_code == 200
+
+        total_probs = 0
+        completions = res.body["completion_probabilities"]
+        assert len(completions) == n_predict
+        for tok in completions:
+            # Handling of 0.0 probabilities differs between samplers and backend sampling. Filter them to normalize the
+            # data.
+            tok["top_probs"] = [x for x in tok["top_probs"] if x["prob"] > 0.0]
+            total_probs += len(tok["top_probs"])
+        # Verify that we got at least two top probs on average, to ensure the effectiveness of the test.
+        assert total_probs >= 2 * n_predict
+        return completions
+
+    def verify_token(a, b):
+        assert a["id"] == b["id"]
+        assert a["token"] == b["token"]
+        assert a["bytes"] == b["bytes"]
+        assert a["prob"] == pytest.approx(b["prob"], abs=0.01)
+
+    for (a, b) in zip(make_request(True), make_request(False)):
+        verify_token(a, b)
+        assert len(a["top_probs"]) == len(b["top_probs"])
+
+        for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
+            verify_token(aa, bb)
 
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
@@ -563,9 +617,182 @@ def test_cancel_request():
     except requests.exceptions.ReadTimeout:
         pass # expected
     # make sure the slot is free
-    time.sleep(1) # wait for HTTP_POLLING_SECONDS
+    time.sleep(2)
     res = server.make_request("GET", "/slots")
     assert res.body[0]["is_processing"] == False
+
+
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _stream_chat_and_collect(server: ServerProcess, content: str, results: dict) -> None:
+    """Background-thread worker: streams a chat completion, records the
+    completion id from the first chunk into `results["id"]`, counts content
+    chunks into `results["n_chunks"]`, and marks `results["ended"] = True`
+    once the stream terminates (naturally or via cancel). Any exception is
+    captured in `results["error"]` rather than raised, since this runs off
+    the main test thread.
+    """
+    try:
+        for data in server.make_stream_request("POST", "/chat/completions", data={
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+        }):
+            if "id" not in results and data.get("id"):
+                results["id"] = data["id"]
+            choices = data.get("choices") or []
+            if choices and choices[0].get("delta", {}).get("content"):
+                results["n_chunks"] = results.get("n_chunks", 0) + 1
+    except Exception as e:
+        results["error"] = str(e)
+    finally:
+        results["ended"] = True
+
+
+def test_explicit_cancel_request():
+    """self.ai#39 R2: an explicit POST /v1/chat/completions/control
+    {"action": "cancel"} call stops an in-flight generation immediately,
+    without requiring the client to drop its connection and without waiting
+    out HTTP_POLLING_SECONDS -- unlike test_cancel_request() above, the
+    client connection here is kept open the whole time."""
+    global server
+    server.n_ctx = 4096
+    server.n_predict = -1
+    server.n_slots = 1
+    server.server_slots = True
+    server.start()
+
+    results: dict = {}
+    t = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story", results), daemon=True)
+    t.start()
+
+    # wait until generation has actually started (we've seen a completion id)
+    assert _wait_until(lambda: "id" in results, timeout=10.0), "never received a completion id from the stream"
+    cmpl_id = results["id"]
+
+    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
+        "id": cmpl_id,
+        "action": "cancel",
+    })
+    assert cancel_res.status_code == 200
+    assert cancel_res.body.get("success") is True
+
+    # the client's own stream must end on its own (a proper final chunk +
+    # [DONE]), not hang waiting for a chunk that never comes -- this is only
+    # true because the CANCEL task handler now sends a final response before
+    # releasing the slot (see server-context.cpp SERVER_TASK_TYPE_CANCEL)
+    assert _wait_until(lambda: results.get("ended", False), timeout=2.0), \
+        "stream did not end promptly after explicit cancel (client-visible hang)"
+    assert "error" not in results, f"stream ended with an error: {results.get('error')}"
+
+    # the slot must be free well within one HTTP_POLLING_SECONDS interval,
+    # since the cancel is now a push instead of a poll
+    assert _wait_until(
+        lambda: server.make_request("GET", "/slots").body[0]["is_processing"] == False,
+        timeout=1.0,
+    ), "slot was not freed promptly after explicit cancel"
+
+
+def test_explicit_cancel_unknown_id():
+    """Cancelling a completion id that never existed must be a clean no-op,
+    not a crash, hang, or 500."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/chat/completions/control", data={
+        "id": "chatcmpl-does-not-exist",
+        "action": "cancel",
+    })
+    assert res.status_code == 200
+    assert res.body.get("success") is False
+
+
+def test_explicit_cancel_already_completed():
+    """Cancelling a completion id that has already finished must be a clean
+    no-op, not a crash, hang, or 500 -- the slot has already been released
+    and reused by the time the (now-stale) id is looked up."""
+    global server
+    server.n_predict = 4
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 4,
+    })
+    assert res.status_code == 200
+    cmpl_id = res.body["id"]
+
+    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
+        "id": cmpl_id,
+        "action": "cancel",
+    })
+    assert cancel_res.status_code == 200
+    assert cancel_res.body.get("success") is False
+
+
+def test_explicit_cancel_no_cross_slot():
+    """self.ai#39 R2: cancelling one in-flight completion's id must not
+    affect a different, concurrently-running completion on another slot.
+    completion ids are 32-char random strings minted fresh per request
+    (gen_chatcmplid()), so a collision would only be possible from a
+    targeting bug in the cancel handler, not from the id space itself --
+    this test exercises the real targeting path with two genuinely
+    concurrent requests rather than simulating the race.
+    """
+    global server
+    server.n_ctx = 4096
+    server.n_predict = -1
+    server.n_slots = 2
+    server.server_slots = True
+    server.start()
+
+    results_a: dict = {}
+    results_b: dict = {}
+    t_a = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story about apples", results_a), daemon=True)
+    t_b = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story about oranges", results_b), daemon=True)
+    t_a.start()
+    t_b.start()
+
+    assert _wait_until(lambda: "id" in results_a and "id" in results_b, timeout=10.0), \
+        "both concurrent streams should have started and reported an id"
+    assert results_a["id"] != results_b["id"]
+
+    # cancel only A
+    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
+        "id": results_a["id"],
+        "action": "cancel",
+    })
+    assert cancel_res.status_code == 200
+    assert cancel_res.body.get("success") is True
+
+    # A must end promptly
+    assert _wait_until(lambda: results_a.get("ended", False), timeout=2.0), \
+        "cancelled stream A did not end promptly"
+    assert "error" not in results_a
+
+    # exactly one slot (B's) should still be processing right after A's
+    # cancel -- proves the cancel targeted only A's slot, not B's
+    def only_b_processing():
+        slots = server.make_request("GET", "/slots").body
+        processing = [s for s in slots if s["is_processing"]]
+        return len(processing) == 1
+    assert _wait_until(only_b_processing, timeout=1.0), \
+        "expected exactly one slot (B's) still processing after A's explicit cancel"
+    assert results_b.get("ended", False) is False, "B's stream must not have been cancelled by A's cancel call"
+
+    # cleanup: cancel B too so the test doesn't leave a background generation
+    # running past teardown
+    if "id" in results_b:
+        server.make_request("POST", "/v1/chat/completions/control", data={
+            "id": results_b["id"],
+            "action": "cancel",
+        })
+    t_a.join(timeout=5)
+    t_b.join(timeout=5)
 
 
 # this test exercises the host-memory prompt cache

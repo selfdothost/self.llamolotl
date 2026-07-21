@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .. import integrity
 from ..auth import require_scope
 from ..state import (
     CONVERT_HF_TO_GGUF,
@@ -389,7 +390,10 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
                 outfile = MODELS_DIR / out_name
 
                 if outfile.exists():
-                    _record_model_meta(out_name, repo_id, None, "safetensors_converted", quant=outtype)
+                    _record_model_meta(
+                        out_name, repo_id, None, "safetensors_converted",
+                        quant=outtype, size_bytes=outfile.stat().st_size,
+                    )
                     yield json.dumps({"status": "success"}) + "\n"
                     return
 
@@ -435,7 +439,10 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
                 # Restart llama-server to pick up the new model
                 _restart_llama_server()
 
-                _record_model_meta(out_name, repo_id, None, "safetensors_converted", quant=outtype)
+                _record_model_meta(
+                    out_name, repo_id, None, "safetensors_converted",
+                    quant=outtype, size_bytes=outfile.stat().st_size if outfile.exists() else None,
+                )
                 yield json.dumps({"status": "success"}) + "\n"
                 return
 
@@ -445,12 +452,23 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
             standalone_gguf: List[str] = []
 
             for gf in gguf_files:
-                m = _SPLIT_SHARD_RE.search(gf)
+                # match against the basename, not the full repo-relative path — gf
+                # includes any subdirectory prefix (e.g. "UD-Q4_K_XL/Model-00001-
+                # of-00002.gguf"), and m.start() is used below to slice
+                # Path(gf).name (basename only). Searching the full path made
+                # m.start() basename-length-mismatched by len(parent)+1 chars,
+                # so shards sharing a subdirectory prefix (extremely common —
+                # e.g. every Unsloth per-quant subfolder) got sliced at the wrong
+                # offset and landed in DIFFERENT groups instead of one. Each
+                # "group" of 1 was then treated as a standalone file: only the
+                # requested shard downloaded, the rest silently skipped, and the
+                # endpoint still reported "success" on the truncated model.
+                name = Path(gf).name
+                m = _SPLIT_SHARD_RE.search(name)
                 if m:
-                    base = gf[:gf.rfind("-", 0, m.start()) + 1] if "-" in gf[:m.start()] else gf[:m.start()]
                     # Use directory + base as key to group shards
                     parent = str(Path(gf).parent)
-                    key = f"{parent}/{Path(gf).name[:m.start()]}"
+                    key = f"{parent}/{name[:m.start()]}"
                     shard_groups.setdefault(key, []).append(gf)
                 else:
                     standalone_gguf.append(gf)
@@ -547,38 +565,80 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
                     _active_downloads.pop(download_key, None)
                     return
 
-                # Sum up downloaded bytes across all files
+                # Sum up downloaded bytes across all files. hf_hub_download() below
+                # is called with local_dir=MODELS_DIR, which routes through
+                # huggingface_hub's "local dir download" mode (the default since
+                # huggingface_hub 0.23 — see huggingface_hub._local_folder). In
+                # that mode the finished file lands at MODELS_DIR/<dl_file>, but
+                # while a download is in progress the bytes accumulate at:
+                #   MODELS_DIR/.cache/huggingface/download/<dl_file>.<etag>.incomplete
+                # (get_local_download_paths().incomplete_path(etag) — confirmed
+                # live against huggingface_hub 0.24.7 by watching a real download:
+                # the file appears at that exact path and grows chunk by chunk).
+                # That's a different location *and* naming scheme (etag-suffixed,
+                # under a `.cache/huggingface/download/` subtree) than the
+                # pre-0.23 blob-cache-then-copy layout
+                # (~/.cache/huggingface/hub/models--.../blobs/<hash>.incomplete)
+                # this code used to assume, which is why `completed` always read
+                # back as 0 during the download: none of the paths it checked
+                # ever existed for the current huggingface_hub cache layout.
+                hf_download_meta_dir = MODELS_DIR / ".cache" / "huggingface" / "download"
                 current_size = 0
                 seen_inodes = set()
                 for dl_file in files_to_download:
                     dl_name = Path(dl_file).name
-                    # Check completed file at top-level or in repo subdir
+                    file_size = 0
+
+                    # Completed file at top-level or in repo subdir
                     for check_path in [MODELS_DIR / dl_name, MODELS_DIR / dl_file]:
                         if check_path.exists():
                             try:
                                 st = check_path.stat()
                                 if st.st_ino not in seen_inodes:
                                     seen_inodes.add(st.st_ino)
-                                    current_size += st.st_size
+                                    file_size = st.st_size
                             except OSError:
                                 pass
                             break
 
-                    # Check for .incomplete temp file for THIS specific file
-                    if current_size == 0:
-                        for incomplete_path in [
-                            MODELS_DIR / f"{dl_name}.incomplete",
-                            MODELS_DIR / dl_file / ".incomplete",
-                            MODELS_DIR / f"{dl_file}.incomplete",
-                        ]:
-                            if incomplete_path.exists():
+                    # Not finished yet — read the in-progress bytes from the
+                    # "<dl_file>.<etag>.incomplete" file in huggingface_hub's
+                    # local-dir download metadata dir. The etag isn't known here
+                    # without an extra API call, so glob for it instead.
+                    if file_size == 0:
+                        incomplete_target = hf_download_meta_dir / dl_file
+                        if incomplete_target.parent.exists():
+                            for incomplete in incomplete_target.parent.glob(
+                                f"{incomplete_target.name}.*.incomplete"
+                            ):
                                 try:
-                                    current_size += incomplete_path.stat().st_size
+                                    file_size += incomplete.stat().st_size
                                 except OSError:
                                     pass
                                 break
 
-                # Last resort: check HF cache for this specific repo's incomplete files
+                    # Legacy fallback: huggingface_hub < 0.23 downloaded through
+                    # the shared blob cache (cache_dir) before copying into
+                    # local_dir, instead of writing straight into local_dir.
+                    if file_size == 0:
+                        for legacy_incomplete in [
+                            MODELS_DIR / f"{dl_name}.incomplete",
+                            MODELS_DIR / dl_file / ".incomplete",
+                            MODELS_DIR / f"{dl_file}.incomplete",
+                        ]:
+                            if legacy_incomplete.exists():
+                                try:
+                                    file_size += legacy_incomplete.stat().st_size
+                                except OSError:
+                                    pass
+                                break
+
+                    current_size += file_size
+
+                # Last resort: pre-0.23 huggingface_hub blob-cache layout (see
+                # the legacy fallback above) under the *shared* HF cache dir
+                # rather than local_dir — only ever populated by old
+                # huggingface_hub versions that don't honor local_dir directly.
                 if current_size == 0:
                     # Respect HF_HOME env var (set in docker-compose as /workspace/hf-hub)
                     hf_home = os.environ.get("HF_HOME")
@@ -668,6 +728,7 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
                     # Fall back to checking top-level if subdir paths don't exist
                     if combined_size == 0:
                         combined_size = check_path.stat().st_size
+                    final_size = combined_size
                     yield json.dumps({
                         "status": "downloading",
                         "digest": first_file,
@@ -675,15 +736,16 @@ async def pull_model(req: ModelPullRequest, _auth=Depends(require_scope("models:
                         "total": combined_size,
                     }) + "\n"
                 else:
+                    final_size = check_path.stat().st_size
                     yield json.dumps({
                         "status": "downloading",
                         "digest": check_path.name,
-                        "completed": check_path.stat().st_size,
-                        "total": check_path.stat().st_size,
+                        "completed": final_size,
+                        "total": final_size,
                     }) + "\n"
                 # Restart llama-server so it discovers the new model
                 _restart_llama_server()
-                _record_model_meta(first_file, repo_id, selected, "gguf")
+                _record_model_meta(first_file, repo_id, selected, "gguf", size_bytes=final_size)
                 yield json.dumps({"status": "success"}) + "\n"
             else:
                 yield json.dumps({"error": "Download completed but file not found in models directory"}) + "\n"
@@ -771,6 +833,30 @@ def delete_gguf_model(req: ModelDeleteRequest, _auth=Depends(require_scope("mode
 
     _remove_model_meta(Path(req.name).name)
     return {"deleted": True, "name": req.name, "files_removed": deleted}
+
+
+# ─── Model Integrity Sweep (self.llamolotl#23) ─────────────────────────
+# The real, filesystem-backed half of the fix self.ai!126 could only
+# stopgap over HTTP -- see api/integrity.py's module docstring for the
+# full scope note.
+
+@router.get("/api/integrity")
+def get_model_integrity(_auth=Depends(require_scope("models:read"))):
+    """Findings from the periodic /models integrity sweep
+    (integrity.run_periodic_sweep), cached from the most recent cycle.
+    Empty until the first sweep completes, or permanently empty if the
+    sweep is disabled via ENABLE_MODEL_INTEGRITY_SWEEP=false."""
+    return integrity.get_last_sweep()
+
+
+@router.post("/api/integrity/sweep")
+def trigger_model_integrity_sweep(_auth=Depends(require_scope("models:pull"))):
+    """Force an immediate integrity sweep instead of waiting for the next
+    periodic cycle. Gated on models:pull rather than models:read because,
+    with ENABLE_MODEL_INTEGRITY_AUTOPULL=true, a sweep can kick off a
+    re-pull -- the same scope /api/models/pull itself requires."""
+    integrity.sweep_once()
+    return integrity.get_last_sweep()
 
 
 # ─── HF Cache Endpoints ────────────────────────────────────────────────

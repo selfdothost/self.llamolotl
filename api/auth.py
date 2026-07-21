@@ -9,13 +9,16 @@ signature, audience, expiry, and scope are all checked.
 
 First cut is deliberately narrow: self.ai <-> self.llamolotl only. Other
 backends (self.curator, self.code-eval, self.language-eval,
-self.faster-whisper) are explicit follow-up scope once this pattern is
+self.transcribe) are explicit follow-up scope once this pattern is
 proven, not handled here (see self.ai#25).
 
 Scope taxonomy (mirror of self.ai's minting side in
 api/selfai_ui/utils/service_auth.py — keep both lists in sync):
-  models:read     - list/inspect models, GGUF cache/fasttext status
-  models:pull     - download a model (HF pull, hf-cache ensure, fasttext ensure)
+  models:read     - list/inspect models, GGUF cache/fasttext status, read
+                    integrity sweep findings (GET /api/integrity)
+  models:pull     - download a model (HF pull, hf-cache ensure, fasttext
+                    ensure), force an integrity sweep (POST /api/integrity/
+                    sweep — can trigger an autopull re-download)
   models:delete   - delete a GGUF model file
   models:write    - register a model (symlink into the top-level models dir)
   system:read     - read chat-template / active-lora / health-adjacent state

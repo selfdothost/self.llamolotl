@@ -76,20 +76,25 @@ def temp_workspace(tmp_path):
     configs = tmp_path / "configs"
     outputs = tmp_path / "outputs"
     logs = tmp_path / "logs"
+    models = tmp_path / "models"
     configs.mkdir()
     outputs.mkdir()
     logs.mkdir()
+    models.mkdir()
 
     jobs_file = tmp_path / "jobs.json"
     pipeline_file = tmp_path / "pipeline_tasks.json"
+    models_meta_file = models / "models_meta.json"
 
     return {
         "workspace": tmp_path,
         "configs": configs,
         "outputs": outputs,
         "logs": logs,
+        "models": models,
         "jobs_file": jobs_file,
         "pipeline_file": pipeline_file,
+        "models_meta_file": models_meta_file,
     }
 
 
@@ -101,6 +106,8 @@ _PATH_ATTRS = [
     ("LOGS_DIR", "logs"),
     ("JOBS_STATE_FILE", "jobs_file"),
     ("PIPELINE_STATE_FILE", "pipeline_file"),
+    ("MODELS_DIR", "models"),
+    ("MODELS_META_FILE", "models_meta_file"),
 ]
 
 # All modules that import path constants from state
@@ -117,6 +124,7 @@ _MODULES_TO_PATCH = [
 def patched_state(temp_workspace):
     """Patch state module and all routers to use temp workspace."""
     import api.state as state
+    import api.integrity as integrity_mod
     import api.routers.jobs as jobs_mod
     import api.routers.models as models_mod
     import api.routers.pipeline as pipeline_mod
@@ -143,6 +151,16 @@ def patched_state(temp_workspace):
     state._pipeline_tasks.clear()
     state._pipeline_processes.clear()
 
+    # integrity.py reads state.MODELS_DIR/MODELS_META_FILE dynamically
+    # (via `state.<attr>` at call time, not a direct name import), so
+    # patching state's own attributes above is enough for it to see the
+    # temp workspace -- it doesn't need its own entry in `modules`. Its
+    # module-level findings cache and autopull dedup set still need
+    # resetting between tests, same as the in-memory state above.
+    integrity_mod._warnings = []
+    integrity_mod._last_sweep_at = None
+    integrity_mod._autopull_in_progress.clear()
+
     yield state
 
     # Restore
@@ -152,6 +170,9 @@ def patched_state(temp_workspace):
     state._processes.clear()
     state._pipeline_tasks.clear()
     state._pipeline_processes.clear()
+    integrity_mod._warnings = []
+    integrity_mod._last_sweep_at = None
+    integrity_mod._autopull_in_progress.clear()
 
 
 @pytest.fixture
