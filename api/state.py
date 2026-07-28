@@ -151,6 +151,21 @@ class HealthResponse(BaseModel):
     running_jobs: int
     jobs_total: int
     api_version: str
+    # Single-model-shaped leftover (self.llamolotl#25): this deployment runs
+    # llama-server in router mode (LLAMA_ARG_MODELS_DIR/LLAMA_ARG_MODELS_MAX,
+    # set by selfai/self.ai's manifests/llamolotl/10-deployment.yaml — not by
+    # anything in this repo), where up to MODELS_MAX models can be loaded
+    # concurrently, so a single optional string can never represent "the"
+    # loaded model. In practice it's currently always None anyway:
+    # _check_inference_health() reads model_path/model off llama-server's
+    # /health response, but the vendored llama-server's /health returns a
+    # bare {"status": "ok"} with no model field at all (server-context.cpp's
+    # get_health), in either single-model or router mode. Real per-model
+    # status lives at the router's own GET /models, not here. Left as-is
+    # rather than reshaped into a list, since no caller currently reads this
+    # field for anything beyond display — flagged so a future fix reshapes
+    # it deliberately instead of assuming single-model semantics are still
+    # accurate.
     loaded_model: Optional[str] = None
     active_loras: Optional[List[Dict[str, Any]]] = None
     gpu_available: Optional[bool] = None
@@ -158,6 +173,111 @@ class HealthResponse(BaseModel):
     gpu_memory_total_gb: Optional[float] = None
     disk_models_free_gb: Optional[float] = None
     disk_workspace_free_gb: Optional[float] = None
+
+
+class VramStateResponse(BaseModel):
+    """Wire format for the GPU-lease broker's VRAM-state query (cavekit
+    gpu-lease-client R1). Every memory figure is in **bytes** at the wire
+    level — deliberately, not MiB/GB: self.llamolotl#22/#27's existing
+    eviction/verification code already works in bytes internally (MiB only
+    appears in log/error strings), and core's lease registry parses these
+    fields directly, so stating bytes on the wire avoids a unit mismatch at
+    the protocol boundary. Core reads `held_vram_bytes` / `total_capacity_bytes`
+    with no translation.
+
+    Reachability is a tri-state signal, NOT a magnitude: when the GPU or the
+    router cannot be reached, the held figure is surfaced as unknown via
+    `status` (and the corresponding `*_reachable` flag), NEVER silently
+    coerced to 0 — a false zero could let core over-grant VRAM that is not
+    actually free (R1-AC4). Held/capacity are `int` when the GPU is reachable
+    and `null` (not 0) when it is unreachable: a JSON null is unambiguously
+    distinct from a genuine near-zero reading (R1-AC3/AC4), so core keys on
+    `status`/`*_reachable` and treats a null held/capacity as "unknown", never
+    as free VRAM. This is the T-003 endpoint's marshalling contract: it maps
+    the probe's `None` straight through to `null` rather than defaulting to 0.
+
+    Field units/meanings (documented per R1-AC5 for direct parse):
+    - held_vram_bytes:     bytes of GPU memory currently in use on the device
+                           (from `nvidia-smi memory.used`), computed live per
+                           call, never cached (R1-AC2). Near-zero (a real int,
+                           not null) when no models are resident (R1-AC3);
+                           `null` only when the GPU is unreachable (R1-AC4).
+    - total_capacity_bytes: total addressable device VRAM in bytes
+                           (from `nvidia-smi memory.total`); `null` when the
+                           GPU is unreachable.
+    - gpu_reachable:       True iff the live `nvidia-smi` query succeeded this
+                           call; False means held/capacity could not be read
+                           from the GPU.
+    - router_reachable:    True iff the router's `GET /models` answered this
+                           call; False means the resident-model cross-check
+                           was unavailable.
+    - resident_model_count: number of models the router reports resident, used
+                           to corroborate the held figure; None when the
+                           router is unreachable.
+    - status:              "ok" when the GPU is reachable, else "unreachable"
+                           — the discriminator a caller keys on instead of
+                           trusting a held value.
+    """
+    held_vram_bytes: Optional[int] = None  # null (not 0) when GPU unreachable
+    total_capacity_bytes: Optional[int] = None  # null when GPU unreachable
+    gpu_reachable: bool
+    router_reachable: bool
+    resident_model_count: Optional[int] = None
+    status: str  # "ok" | "unreachable"
+    # The model currently resident in the router (router mode keeps ≤1 loaded),
+    # or null when none is loaded / the router is unreachable. Same value the
+    # `/health` endpoint reports via `_check_inference_health()`; surfaced here so
+    # core's VRAM-state poller can relay it into the lease registry, letting the
+    # chat admission checkpoint route an eval-window request to the already-loaded
+    # model instead of forcing a competing load (self.ai#35 / self.ai!225 T-000-VS).
+    loaded_model: Optional[str] = None
+
+
+class VramReleaseRequest(BaseModel):
+    """A release-request the GPU-lease broker (core, self.ai) sends this
+    instance (cavekit gpu-lease-client R2-AC1). Amount-based only, in bytes.
+
+    Field names/units are chosen to align with core's release-request
+    protocol by convention (self.ai's `cavekit-gpu-lease-broker.md` R2) —
+    bytes to match R1/`VramStateResponse`. NOTE: that counterpart kit does
+    NOT exist in this repo, so this alignment is aspirational-by-convention,
+    not a live cross-check; if core's actual field names differ, reconcile
+    there rather than guessing a different shape here.
+
+    Deliberately carries NO `mechanism` field: core asks for N bytes back and
+    this repo alone decides how to free them (whole-model eviction for now).
+    A future richer release mechanism (e.g. n-cpu-moe partial offload) is
+    therefore a same-protocol upgrade, not a wire-format change.
+
+    - target_bytes:     bytes of VRAM the caller wants freed. The instance
+                        frees up to this much; may free less if fewer bytes
+                        are safely evictable (R2-AC5/AC7).
+    - timeout_seconds:  wall-clock budget the caller allows for the release;
+                        the handler responds within it with whatever was
+                        actually confirmed freed, never blocking past it.
+    """
+    target_bytes: int
+    timeout_seconds: float
+
+
+class VramReleaseResponse(BaseModel):
+    """Result of a release-request (cavekit gpu-lease-client R2). Bytes, to
+    match `VramReleaseRequest`/`VramStateResponse`.
+
+    - freed_bytes:      bytes actually freed, VERIFIED via a live GPU query
+                        after the unload(s) (R2-AC4) — never the assumed
+                        outcome of an unload call returning success. May be
+                        < target_bytes, or 0 if nothing was safely evictable.
+    - status:           "released" (freed something up to/over target),
+                        "partial" (freed less than target — nothing more was
+                        safely evictable), or "busy" (another release was
+                        already in flight; this one was not run — R2-AC6).
+    - evicted_models:   names of the models actually unloaded this pass, for
+                        the caller's audit; empty when nothing was evicted.
+    """
+    freed_bytes: int
+    status: str  # "released" | "partial" | "busy"
+    evicted_models: List[str] = []
 
 
 class ModelPullRequest(BaseModel):
@@ -355,6 +475,22 @@ _llama_watchdog_last_fired: Optional[float] = None
 # response) clears its entry, same forward-progress model as
 # _llama_unhealthy_since above.
 _llama_model_loading_since: Dict[str, float] = {}
+
+# Per-model-name monotonic timestamp of when a model was FIRST observed in a
+# stable "loaded" state via the router's GET /models. This is the fallback
+# LRU-ordering signal for the GPU-lease release path (cavekit
+# gpu-lease-client R2, _select_models_to_evict): the router's GET /models
+# response does NOT expose a per-model last-used timestamp — the C++ side
+# tracks `meta.last_used` internally (server-models.h:115, "for LRU
+# unloading") and orders its OWN internal evict_for_vram()/unload_lru() by
+# it, but never serializes it into the /models JSON (get_router_models,
+# server-models.cpp:1989-2002, emits id/status/architecture/… only). So this
+# Python layer cannot read true last-used order over HTTP and approximates
+# LRU as oldest-FIRST-SEEN-loaded-first: earliest resident is evicted first.
+# A name leaving the "loaded" set (unloaded, loading, sleeping, or absent
+# from the next response) clears its entry, same forward-progress model as
+# _llama_model_loading_since above. Refreshed inside _select_models_to_evict.
+_llama_model_loaded_since: Dict[str, float] = {}
 
 
 # ─── Path Safety ────────────────────────────────────────────────────────
@@ -959,6 +1095,82 @@ def _check_gpu() -> tuple:
     return False, None, None
 
 
+def _probe_gpu_memory_bytes() -> tuple:
+    """Byte-precision live GPU memory query via nvidia-smi.
+
+    Modeled on _check_gpu() above but deliberately does NOT round to GB and
+    does NOT fall back to torch: this feeds the GPU-lease broker's held-VRAM
+    figure (cavekit gpu-lease-client R1), where a false zero could let core
+    over-grant VRAM that isn't actually free (R1-AC4). torch's fallback path
+    can only report total memory (it returns used=None), so it cannot
+    distinguish "used is genuinely unknown" from "zero used" — using it here
+    would risk exactly that false zero, so a torch-only situation is treated
+    as unreachable instead.
+
+    Returns (reachable: bool, used_bytes: int|None, total_bytes: int|None).
+    reachable is False (and both figures None) if nvidia-smi is missing,
+    times out, errors, or returns an unparseable line — the caller surfaces
+    that as unreachable, never as 0. nvidia-smi emits MiB (--format nounits),
+    multiplied by 1024*1024 for bytes.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            line = result.stdout.strip().split("\n")[0]
+            used_mib, total_mib = [float(x.strip()) for x in line.split(",")]
+            return True, int(used_mib * 1024 * 1024), int(total_mib * 1024 * 1024)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log.debug("nvidia-smi byte-precision VRAM probe failed: %s", e)
+    return False, None, None
+
+
+def _probe_vram_state() -> dict:
+    """Live held-VRAM + total-capacity introspection for the GPU-lease
+    broker (cavekit gpu-lease-client R1). Computed FRESH on every call — no
+    caching, no reuse of a stored figure (the `checked_at`-is-live discipline
+    self.llamolotl#27/#9 both state; a stale cached answer defeats the point).
+
+    Combines two independent live probes, the same technique
+    _check_inference_health() + #27's live verification establish:
+    - GPU side: _probe_gpu_memory_bytes() (byte-precision nvidia-smi) gives
+      the authoritative held (`memory.used`) and total (`memory.total`)
+      figures.
+    - Router side: _probe_llama_server_models_status() (GET localhost:8080/
+      models) enumerates the resident model set to CORROBORATE the held
+      figure. A None return means the router is unreachable — surfaced as
+      `router_reachable=False`, distinct from "reachable, zero models".
+
+    Reachability is an explicit tri-state per source. If nvidia-smi fails,
+    `gpu_reachable=False` and held/capacity are None — NEVER coerced to 0
+    (R1-AC4). `status` is "ok" only when the GPU is reachable, else
+    "unreachable". With no models resident but the GPU reachable, held
+    reports the real (near-zero) `memory.used`, not null (R1-AC3).
+
+    Returns a dict with keys: held_vram_bytes (int|None), total_capacity_bytes
+    (int|None), gpu_reachable (bool), router_reachable (bool),
+    resident_model_count (int|None), status ("ok"|"unreachable"). The
+    marshalling into VramStateResponse (and the None→endpoint handling) is
+    the endpoint's job (T-003).
+    """
+    gpu_reachable, used_bytes, total_bytes = _probe_gpu_memory_bytes()
+
+    models = _probe_llama_server_models_status()
+    router_reachable = models is not None
+    resident_model_count = len(models) if router_reachable else None
+
+    return {
+        "held_vram_bytes": used_bytes,
+        "total_capacity_bytes": total_bytes,
+        "gpu_reachable": gpu_reachable,
+        "router_reachable": router_reachable,
+        "resident_model_count": resident_model_count,
+        "status": "ok" if gpu_reachable else "unreachable",
+    }
+
+
 def _check_disk(path: str) -> float:
     """Return free disk space in GB for given path."""
     try:
@@ -1330,6 +1542,322 @@ def _probe_llama_server_models_status() -> Optional[list]:
     except Exception as e:
         log.debug("llama-server watchdog: could not query /models for per-model status: %s", e)
         return None
+
+
+def _unload_model_via_router(name: str) -> bool:
+    """Evict a whole model from the router via its existing public HTTP
+    surface: POST http://localhost:8080/models/unload (cavekit
+    gpu-lease-client R2 — the eviction primitive T-007 orchestrates). No new
+    C++ router internals; this is the same "call the router's public HTTP
+    surface from Python" pattern apply_loras() (routers/system.py:140-149)
+    already uses to POST /lora-adapters — urllib.request.Request(...,
+    method="POST") with a JSON body.
+
+    INVESTIGATION GUARD (T-004) — the request body field name is CONFIRMED,
+    not assumed: the router's handler (post_router_models_unload,
+    self.llama/tools/server/server-models.cpp:2021-2037) reads the model id
+    with `json_value(body, "model", ...)` — the field is **"model"** (not
+    "id"/"name") — and answers `{"success": true}` on success, or a non-2xx
+    format_error_response when the model is unknown or not running.
+
+    Never raises on a router HTTP error (logs and returns False) so the
+    orchestrator (T-007) stays timeout-bounded. Returns True only on a 2xx.
+    """
+    import urllib.request
+    try:
+        payload = json.dumps({"model": name}).encode()
+        api_req = urllib.request.Request(
+            "http://localhost:8080/models/unload",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(api_req, timeout=5) as resp:
+            resp.read()
+        return True
+    except Exception as e:
+        log.warning("router /models/unload failed for model %r: %s", name, e)
+        return False
+
+
+def _lookup_model_size_bytes(name: str) -> Optional[int]:
+    """Best-effort per-model VRAM footprint (in bytes) for the LRU eviction
+    accumulator (T-006). The router's GET /models does NOT expose a per-model
+    footprint, so this reads the `size_bytes` _record_model_meta() persisted
+    at pull time (models-meta sidecar). That is the model's on-DISK GGUF size,
+    used here as a proxy for its resident VRAM footprint — close for a
+    fully-offloaded GGUF but not exact (no KV-cache/overhead accounting). The
+    authoritative freed figure is always the post-eviction live GPU delta
+    (T-007/R2-AC4); this size only ORDERS/accumulates the selection.
+
+    models-meta is keyed by model filename while the router reports model
+    `id` (name/alias), so this tries a few reconciliations: exact key, key
+    with a .gguf suffix, then a key whose stem matches. Returns None when no
+    recorded size is found (caller treats it as unknown, not zero).
+    """
+    meta = _load_models_meta()
+    for key in (name, f"{name}.gguf"):
+        entry = meta.get(key)
+        if isinstance(entry, dict) and isinstance(entry.get("size_bytes"), int):
+            return entry["size_bytes"]
+    for key, entry in meta.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("size_bytes"), int):
+            continue
+        if key == name or key.rsplit(".", 1)[0] == name:
+            return entry["size_bytes"]
+    return None
+
+
+def _select_models_to_evict(target_bytes: int) -> list:
+    """Select resident models to unload, in LRU order, to free ~target_bytes
+    (cavekit gpu-lease-client R2-AC2/AC3). Reads the resident set via
+    _probe_llama_server_models_status() and returns a list of dicts:
+    [{"name": str, "size_bytes": int|None}, ...] in eviction order.
+
+    Stable-LOADED only (R2-AC3): only models whose `status.value == "loaded"`
+    are eligible. "loading"/"sleeping"/"downloading"/"unloaded" are skipped —
+    evicting a mid-load or mid-request model is worse than the OOM this
+    protocol prevents (same safety self.llamolotl#22's evict_for_vram()
+    applies internally). server_model_status_to_string values confirmed in
+    self.llama/tools/server/server-models.h:52-60.
+
+    INVESTIGATION GUARD (T-006) — CONDITIONAL fallback path taken: the
+    router's GET /models response exposes NEITHER a per-model VRAM size NOR a
+    last-used timestamp (get_router_models, server-models.cpp:1989-2002 —
+    id/aliases/tags/status/architecture/source only; the internal
+    `meta.last_used` and footprint bytes are never serialized). So per the
+    build site's [CONDITIONAL], LRU order comes from the module-level
+    _llama_model_loaded_since map (oldest-first-seen-loaded first) and
+    per-model size from _lookup_model_size_bytes() (models-meta `size_bytes`).
+    "Actively serving a request" is likewise not exposed over HTTP; the LRU
+    oldest-first ordering is the available proxy (the most-recently-active
+    model sorts last and is evicted last), and the router's own unload() waits
+    out an in-flight request rather than killing it (server-models.cpp:1294+).
+
+    Accumulates models until the summed size reaches target_bytes or no more
+    evictable models remain (R2-AC7: an over-large target naturally selects
+    everything evictable). Models with an unknown size contribute nothing to
+    the accumulator but are still selected (better to evict and re-verify live
+    than to skip a genuinely resident model over missing metadata).
+    """
+    models = _probe_llama_server_models_status()
+    now = time.monotonic()
+    if not models:
+        # None (unreachable) or [] (nothing resident) → nothing to evict.
+        _llama_model_loaded_since.clear()
+        return []
+
+    loaded = []
+    seen = set()
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("id")
+        status = (entry.get("status") or {}).get("value")
+        if not name or status != "loaded":
+            continue
+        seen.add(name)
+        # First time we see this name stably loaded → stamp it for LRU order.
+        first_seen = _llama_model_loaded_since.setdefault(name, now)
+        loaded.append((first_seen, name))
+
+    # Forward progress: drop tracking for any name no longer stably loaded.
+    for name in list(_llama_model_loaded_since):
+        if name not in seen:
+            del _llama_model_loaded_since[name]
+
+    # LRU: oldest first-seen-loaded first.
+    loaded.sort(key=lambda t: t[0])
+
+    selected = []
+    accumulated = 0
+    for _first_seen, name in loaded:
+        if accumulated >= target_bytes:
+            break
+        size = _lookup_model_size_bytes(name)
+        selected.append({"name": name, "size_bytes": size})
+        if size:
+            accumulated += size
+    return selected
+
+
+# Single-flight guard for the GPU-lease release path (cavekit
+# gpu-lease-client R2-AC6). A module-level threading.Lock (matching the
+# threading.Lock style _state_lock already uses in this module — the release
+# handler and its callees are synchronous), acquired NON-BLOCKING: a second
+# release-request arriving while one is in flight must get an immediate,
+# unambiguous "busy" answer rather than queue-and-race. Running two release
+# passes concurrently would let overlapping unloads free more than either
+# request needed and corrupt _select_models_to_evict's resident-set
+# assumptions, which is exactly the hazard AC6 exists to prevent.
+_vram_release_lock = threading.Lock()
+
+_VRAM_RELEASE_SETTLE_POLL_SECONDS = 0.25
+
+
+def _wait_for_models_unloaded(names: List[str], deadline: float) -> None:
+    """Poll the router's own /models status until every model in `names`
+    reports terminal `unloaded`, or `deadline` (a time.monotonic() value)
+    passes -- whichever first. Ground truth for "has the child process
+    actually exited," since POST /models/unload's HTTP response returning
+    success does not mean that yet (see the caller's comment).
+
+    Bounded by the caller's own timeout budget, not a new one: if the
+    deadline is already past, this returns immediately (checks, doesn't
+    sleep past it) -- the live-verification read that follows may then
+    still catch a model mid-teardown on a very tight timeout, but that is
+    the documented AC5 tradeoff (never block past the caller's timeout),
+    not a regression from this fix. Never raises: an unreachable router
+    during polling just means the loop keeps checking until the deadline,
+    same as any other transient probe failure elsewhere in this module.
+    """
+    pending = set(names)
+    while pending and time.monotonic() < deadline:
+        models = _probe_llama_server_models_status()
+        if models is not None:
+            by_id = {m.get("id"): m for m in models if isinstance(m, dict)}
+            still_loaded = set()
+            for name in pending:
+                m = by_id.get(name)
+                status = (m or {}).get("status", {}).get("value") if m else None
+                if status != "unloaded":
+                    still_loaded.add(name)
+            pending = still_loaded
+        if pending:
+            time.sleep(min(_VRAM_RELEASE_SETTLE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    if pending:
+        log.warning(
+            "vram-release: settle-wait deadline reached with %d model(s) not yet "
+            "confirmed unloaded: %s -- proceeding to live-verify anyway (AC5: "
+            "never block past the caller's timeout)",
+            len(pending), sorted(pending),
+        )
+
+
+def _handle_vram_release(target_bytes: int, timeout_seconds: float) -> "VramReleaseResponse":
+    """Orchestrate a whole-model-eviction release-request (cavekit
+    gpu-lease-client R2 — T-007). Single-flight, timeout-bounded, and
+    live-verified. Synchronous by design: its callees (_probe_vram_state,
+    _select_models_to_evict, _unload_model_via_router) are all sync, and the
+    guard is a threading.Lock like the rest of this module.
+
+    Sequence:
+    1. Single-flight (AC6): acquire `_vram_release_lock` non-blocking. If it
+       is already held, return immediately with status="busy" and freed_bytes=0
+       — no second pass runs. The FastAPI endpoint (T-008) maps "busy" to 409.
+    2. Baseline (for AC4): take a live pre-eviction held-VRAM reading via
+       _probe_vram_state() so step 4 can diff against reality. If the GPU is
+       unreachable at baseline, held is unknown — we cannot compute a verified
+       freed delta, so we do not fabricate one (freed_bytes stays 0).
+    3. Select (AC2/AC3/AC7): _select_models_to_evict(target_bytes) returns the
+       stable-LOADED resident models in LRU order up to target. An over-large
+       target naturally selects everything evictable (AC7) — no capping here.
+    4. Evict, timeout-bounded (AC5): issue _unload_model_via_router() per
+       selected model, checking a wall-clock deadline (time.monotonic() +
+       timeout_seconds) BEFORE each unload. Once the deadline passes we stop
+       issuing further unloads and proceed straight to verification — never
+       blocking past the caller's timeout on a slow/stuck unload. (Each unload
+       call itself is already bounded by its own urlopen timeout and never
+       raises.)
+    4.5. Settle (bugfix, live-validation finding 2026-07-24): the router's
+       POST /models/unload returns {"success": true} as soon as it CALLS
+       models.unload(name) — it does not wait for the child process to
+       actually exit and release its CUDA context. _wait_for_models_unloaded()
+       polls the router's own /models status (ground truth) until every
+       evicted model reaches terminal `unloaded`, bounded by the SAME overall
+       deadline as step 4 — a wait for reality to catch up, not a new
+       unbounded call. Without this, step 5's "post" reading can race the
+       async teardown and wildly undercount freed_bytes (observed live: a
+       14.8GB eviction measured as only ~626MB freed).
+    5. Verify live (AC4): re-query held VRAM via _probe_vram_state() and compute
+       freed = baseline_held - post_held. The confirmed freed_bytes is THIS
+       measured delta, never the assumption that an unload returning True
+       actually freed memory — an unload that "succeeds" but frees nothing
+       yields freed_bytes=0. A negative delta (VRAM grew, e.g. a concurrent
+       load) is clamped to 0.
+
+    Returns a VramReleaseResponse. status is:
+      - "busy"     — another release was already in flight (step 1).
+      - "released" — freed_bytes >= target_bytes (the ask was met or exceeded).
+      - "partial"  — freed_bytes < target_bytes (nothing more was safely
+                     evictable, or the timeout/verification bounded it — may be
+                     0). AC5/AC7: an honest under-target answer, not a denial.
+    """
+    acquired = _vram_release_lock.acquire(blocking=False)
+    if not acquired:
+        log.info("vram-release: busy — a release is already in flight, refusing concurrent pass")
+        return VramReleaseResponse(freed_bytes=0, status="busy", evicted_models=[])
+
+    try:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+        # Pre-eviction live baseline (step 2 / AC4 diff anchor).
+        baseline = _probe_vram_state()
+        baseline_held = baseline.get("held_vram_bytes")
+
+        # LRU / stable-LOADED selection up to target (AC2/AC3/AC7).
+        selected = _select_models_to_evict(target_bytes)
+
+        evicted_models: List[str] = []
+        for model in selected:
+            # Timeout-bounded (AC5): stop before starting another unload once
+            # the caller's wall-clock budget is spent.
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "vram-release: timeout budget (%.3fs) reached after %d unload(s); "
+                    "stopping before remaining %d selected model(s)",
+                    timeout_seconds, len(evicted_models), len(selected) - len(evicted_models),
+                )
+                break
+            name = model["name"]
+            if _unload_model_via_router(name):
+                evicted_models.append(name)
+            # A False (failed) unload is not recorded as evicted; the live
+            # verification below is what actually decides freed_bytes anyway.
+
+        # Settle (bugfix, live-validation finding 2026-07-24): the router's
+        # POST /models/unload handler (post_router_models_unload,
+        # server-models.cpp) calls models.unload(name) and returns
+        # {"success": true} IMMEDIATELY -- it does not block until the child
+        # process actually exits and releases its CUDA context. Taking the
+        # "post" nvidia-smi reading right after the HTTP call returns races
+        # that async teardown: a live test evicting a 14.8GB model measured
+        # only ~626MB freed because the GPU driver hadn't finished releasing
+        # memory yet. Poll the router's own /models status (ground truth for
+        # "has the child actually exited") until every model we evicted
+        # reports terminal `unloaded`, bounded by the SAME overall timeout
+        # budget this function already promises never to exceed (AC5) -- this
+        # is a wait for reality to catch up, not a new unbounded blocking call.
+        if evicted_models:
+            _wait_for_models_unloaded(evicted_models, deadline)
+
+        # Live verification (step 5 / AC4): freed comes from the measured delta,
+        # NEVER from assuming the unload calls above worked.
+        post = _probe_vram_state()
+        post_held = post.get("held_vram_bytes")
+
+        if isinstance(baseline_held, int) and isinstance(post_held, int):
+            freed_bytes = max(0, baseline_held - post_held)
+        else:
+            # GPU unreachable at baseline or post-check → cannot confirm a real
+            # freed figure. Report 0 rather than an unverified assumption (AC4).
+            log.warning(
+                "vram-release: could not live-verify freed VRAM "
+                "(baseline_held=%r, post_held=%r) — reporting freed_bytes=0",
+                baseline_held, post_held,
+            )
+            freed_bytes = 0
+
+        status = "released" if freed_bytes >= target_bytes else "partial"
+        log.info(
+            "vram-release: target=%d confirmed_freed=%d status=%s evicted=%s",
+            target_bytes, freed_bytes, status, evicted_models,
+        )
+        return VramReleaseResponse(
+            freed_bytes=freed_bytes, status=status, evicted_models=evicted_models
+        )
+    finally:
+        _vram_release_lock.release()
 
 
 def _check_llama_server_model_load_staleness() -> Optional[str]:

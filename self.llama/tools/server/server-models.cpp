@@ -1005,14 +1005,14 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
         }
 
         if (lru_name.empty()) {
-            // nothing left we're allowed to evict -- proceed and let the load attempt run.
-            // it may still OOM, but that's the model-doesn't-fit-at-all case, not the
-            // two-models-that-should-have-been-evicted case this issue is about.
-            SRV_WRN("vram-aware eviction: incoming model needs an estimated %lld MiB (+%d MiB margin) "
-                    "but only %lld MiB is free, and no more resident models are safe to evict\n",
-                    (long long) (incoming_bytes / (1024 * 1024)), base_params.models_vram_margin_mb,
-                    (long long) (*free_bytes / (1024 * 1024)));
-            return;
+            // nothing left we're allowed to evict and the incoming model still doesn't fit --
+            // this is the model-doesn't-fit-at-all case (not the two-models-that-should-have-been-
+            // evicted case #22 handles). Don't let the load proceed into a real OOM: raise the
+            // specific terminal error (issue #27), which propagates cleanly out of load() -- we
+            // are called before load() takes its own lock and before any child instance exists,
+            // and the LRU-scan lock above is already released here, so no lock is held. ex_wrapper
+            // maps this to a structured HTTP 503 (T-006).
+            throw server_model_vram_unfittable_error(incoming.name, incoming_bytes, *free_bytes);
         }
 
         SRV_INF("vram-aware eviction: %lld MiB free < needed %lld MiB (est. %lld MiB + %d MiB margin), "

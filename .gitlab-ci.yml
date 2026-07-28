@@ -1,23 +1,27 @@
 # self.llamolotl CI — yard-native inference image build.
 #
-# Reshaped from the pre-shipyard podman/GPU-runner CI to the yard convention:
-# kaniko on the `bigbuild` runner -> container.home (same as self.ai / self.chat
-# / self.finance).
+# buildkit-rootless on the `bigbuild` runner -> container.home (gitlab-profile#60
+# / self.infrastructure#143). NOT kaniko: kaniko's writable layer always lands on
+# the node's containerd root and can't be redirected; buildkit's state is a flag
+# (`--root`) pointed at the /builds mount, and it runs rootless (uid 1000).
 #
 # Two images. The full dual-purpose image (Dockerfile: llama.cpp serving +
-# HF Trainer/DeepSpeed/PEFT training-api under supervisord) is now canonical and
-# owns `:latest` + `:<sha>` (self.ai's llamolotl deployment tracks :latest). The
-# serving-only image (Dockerfile.llama-only) is kept but demoted to
-# `:llama-only-latest` / `:llama-only-<sha>`.
+# HF Trainer/DeepSpeed/PEFT training-api under supervisord) is canonical and owns
+# `:latest` + `:<sha>` (+ `:training-<sha>`). The serving-only image
+# (Dockerfile.llama-only) is demoted to `:llama-only-latest` / `:llama-only-<sha>`.
+# Each image gets its OWN registry cache ref (cache-llama-only vs cache-training)
+# — buildkit registry cache is keyed by ref, so sharing one ref across two
+# different Dockerfiles would thrash the cache (kaniko's layer-keyed cache
+# tolerated the shared ref; buildkit does not).
 #
-# GPU/CUDA: the build is GPU-less (stub libs, GGML_NATIVE=OFF). The image pins
-# CUDA 13.1, which runs on nidavellir's driver 580.105.08 / CUDA 13.0 via CUDA
-# minor-version forward-compatibility (same major 13). Target GPU is the RTX
-# 4090 (sm_89, Ada).
+# NB: buildkit's --local dockerfile= is a DIRECTORY defaulting to a file named
+# `Dockerfile`, so Dockerfile.llama-only is passed via `--opt filename=`.
 #
-# self.llama/ (llama.cpp source) is a vendored subdirectory (folded in from
-# the former self.llama submodule, self.llamolotl#8) -- plain tracked files,
-# no submodule init/fetch step needed.
+# GPU/CUDA: build is GPU-less (stub libs, GGML_NATIVE=OFF). self.llama/ is a
+# vendored subdirectory (plain tracked files, no submodule step).
+#
+# Two-job split per image (selfinfra/zlib reference): build:* is the MR gate
+# (builds, NO push); publish:* builds + pushes on main only.
 
 stages: [build, publish]
 
@@ -31,6 +35,29 @@ default:
 
 variables:
   IMAGE: $CI_REGISTRY_IMAGE
+  BUILDKIT_IMAGE: "moby/buildkit:v0.31.2-rootless"   # pinned, not master
+  # Bursty CI jobs: SMALL requests so a job schedules even on a busy node, HIGH
+  # limits so it can burst when it actually runs. These jobs sit idle until
+  # triggered, need real CPU/RAM only briefly, and don't all run at once — so
+  # right-sizing the request (not the limit) is what lets k8s bin-pack them.
+  # Requires the runner to permit resource overwrites (self.infrastructure#173).
+  KUBERNETES_CPU_REQUEST: "250m"
+  KUBERNETES_CPU_LIMIT: "8"
+  KUBERNETES_MEMORY_REQUEST: "1Gi"
+  KUBERNETES_MEMORY_LIMIT: "16Gi"
+
+# Registry auth + buildkit state dir, both OUTSIDE the build context (a SIBLING
+# of $CI_PROJECT_DIR): the CI_JOB_TOKEN credential must never sit where a
+# `COPY . .` could bake it into the image (gitlab-profile#60 trap 3). --root
+# points build bytes at the /builds mount, off the node containerd root (#143).
+.buildkit-before: &buildkit-before
+  - export BK_SCRATCH="${CI_BUILDS_DIR:-/builds}/.buildkit"
+  - mkdir -p "$BK_SCRATCH" 2>/dev/null || export BK_SCRATCH="$(dirname "$CI_PROJECT_DIR")/.buildkit"
+  - mkdir -p "$BK_SCRATCH/state" "$BK_SCRATCH/docker"
+  - export DOCKER_CONFIG="$BK_SCRATCH/docker"
+  - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > "$DOCKER_CONFIG/config.json"
+  - chmod 600 "$DOCKER_CONFIG/config.json"
+  - export BUILDKITD_FLAGS="--oci-worker-no-process-sandbox --root $BK_SCRATCH/state"
 
 # --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
 sync:public-alpha:
@@ -38,45 +65,78 @@ sync:public-alpha:
   variables:
     MIRROR_EXCLUDE_PATHS: "context"
 
+# --- llama-server (serving-only) : MR gate — build, NO push ---
 build:llama-server:
   stage: build
-  image:
-    name: gcr.io/kaniko-project/executor:debug
-    entrypoint: [""]
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
   timeout: 2h
-  before_script:
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
-  script:
-    - >
-      /kaniko/executor
-      --context "$CI_PROJECT_DIR"
-      --dockerfile Dockerfile.llama-only
-      --cache=true --cache-repo "$IMAGE/cache"
-      --destination "$IMAGE:llama-only-$CI_COMMIT_SHORT_SHA"
-      --destination "$IMAGE:llama-only-latest"
+  before_script: *buildkit-before
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --opt filename=Dockerfile.llama-only
+      --import-cache "type=registry,ref=${IMAGE}/cache-llama-only"
+      --export-cache "type=registry,ref=${IMAGE}/cache-llama-only,mode=max"
 
+# --- llama-server (serving-only) : build + push llama-only tags (main) ---
+publish:llama-server:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 2h
+  before_script: *buildkit-before
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - export TAGS="${IMAGE}:llama-only-${CI_COMMIT_SHORT_SHA},${IMAGE}:llama-only-latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --opt filename=Dockerfile.llama-only
+      --import-cache "type=registry,ref=${IMAGE}/cache-llama-only"
+      --export-cache "type=registry,ref=${IMAGE}/cache-llama-only,mode=max"
+      --output "$OUT"
+
+# --- training (full dual-purpose) : MR gate — build, NO push ---
 build:training:
   stage: build
-  image:
-    name: gcr.io/kaniko-project/executor:debug
-    entrypoint: [""]
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
   timeout: 4h
-  before_script:
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
-  script:
-    - >
-      /kaniko/executor
-      --context "$CI_PROJECT_DIR"
-      --dockerfile Dockerfile
-      --cache=true --cache-repo "$IMAGE/cache"
-      --destination "$IMAGE:$CI_COMMIT_SHORT_SHA"
-      --destination "$IMAGE:latest"
-      --destination "$IMAGE:training-$CI_COMMIT_SHORT_SHA"
+  before_script: *buildkit-before
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --import-cache "type=registry,ref=${IMAGE}/cache-training"
+      --export-cache "type=registry,ref=${IMAGE}/cache-training,mode=max"
+
+# --- training (full dual-purpose) : build + push :sha, :latest, :training-sha (main) ---
+publish:training:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 4h
+  before_script: *buildkit-before
+  rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - export TAGS="${IMAGE}:${CI_COMMIT_SHORT_SHA},${IMAGE}:latest,${IMAGE}:training-${CI_COMMIT_SHORT_SHA}"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --import-cache "type=registry,ref=${IMAGE}/cache-training"
+      --export-cache "type=registry,ref=${IMAGE}/cache-training,mode=max"
+      --output "$OUT"

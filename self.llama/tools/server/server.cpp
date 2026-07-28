@@ -61,6 +61,15 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
+        } catch (const server_model_vram_unfittable_error & e) {
+            // incoming model can't fit in VRAM and nothing is safe to evict (issue #27):
+            // a transient "can't serve this right now" condition, not a client error, so map to
+            // ERROR_TYPE_UNAVAILABLE (-> "unavailable_error", HTTP 503; see server-common.cpp).
+            // Must be caught before the generic std::exception below (more specific first), else
+            // it would degrade to a generic 500. .what() carries the model name / estimated
+            // footprint / free VRAM a proxy needs to forward the failure (AC4).
+            error = ERROR_TYPE_UNAVAILABLE;
+            message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
             error = ERROR_TYPE_SERVER;

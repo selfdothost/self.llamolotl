@@ -44,6 +44,14 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+// Clamp the high bound of GPU layers a single device may take to a user/config-set ceiling.
+// A negative ceiling is the sentinel for "auto / unset" and leaves the bound unchanged; a
+// concrete ceiling caps the bound to it (min), so a config-set n_gpu_layers is an upper limit
+// the fit-to-VRAM search may reduce from rather than an exact pin. Declared here (rather than
+// kept file-static in fit.cpp) purely so the ceiling-not-pin decision can be unit tested
+// without a GPU or a device-memory query; it is otherwise an internal fit.cpp helper.
+uint32_t common_fit_clamp_ngl_ceiling(uint32_t n_unassigned_high, int64_t ngl_ceiling);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,

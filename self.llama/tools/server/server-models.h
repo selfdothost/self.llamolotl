@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -68,6 +69,40 @@ static std::string server_model_source_to_string(server_model_source source) {
         default:                             return "unknown";
     }
 }
+
+// Terminal load error (issue #27): raised when an incoming model's estimated VRAM
+// footprint still doesn't fit in free GPU memory after vram-aware eviction has run out
+// of resident models it's safe to evict -- i.e. the model doesn't fit at all, not the
+// two-models-should-have-been-evicted case #22 handles. Carries the three facts a caller
+// (or a proxy forwarding the failure) needs to explain it: the model name, its estimated
+// footprint, and the free VRAM measured at decision time, all in bytes. Raised by
+// server_models::evict_for_vram() (T-005) and mapped to a structured HTTP 503 in
+// ex_wrapper (T-006). The formatted message mirrors the SRV_WRN wording in
+// evict_for_vram(), reporting the byte figures in MiB.
+struct server_model_vram_unfittable_error : std::runtime_error {
+    std::string model_name;
+    int64_t     estimated_footprint_bytes;
+    int64_t     free_vram_bytes;
+
+    server_model_vram_unfittable_error(
+            const std::string & model_name,
+            int64_t estimated_footprint_bytes,
+            int64_t free_vram_bytes)
+        : std::runtime_error(format_message(model_name, estimated_footprint_bytes, free_vram_bytes)),
+          model_name(model_name),
+          estimated_footprint_bytes(estimated_footprint_bytes),
+          free_vram_bytes(free_vram_bytes) {}
+
+    static std::string format_message(
+            const std::string & model_name,
+            int64_t estimated_footprint_bytes,
+            int64_t free_vram_bytes) {
+        return "model name=" + model_name + " does not fit in VRAM: needs an estimated " +
+               std::to_string(estimated_footprint_bytes / (1024 * 1024)) +
+               " MiB but only " + std::to_string(free_vram_bytes / (1024 * 1024)) +
+               " MiB is free, and no more resident models are safe to evict";
+    }
+};
 
 struct server_model_meta {
     server_model_source source = SERVER_MODEL_SOURCE_CACHE;
@@ -185,6 +220,9 @@ private:
     // conservative: no-ops (falls back to the models_max count-based limit only) if free VRAM
     // can't be queried or the incoming model's footprint can't be estimated -- see the
     // implementation comment in server-models.cpp for why and its limitations.
+    // Terminal case (issue #27): if nothing is left it's safe to evict and the incoming model
+    // still won't fit, this THROWS server_model_vram_unfittable_error (above) rather than
+    // letting the load proceed into an OOM; ex_wrapper maps it to a structured HTTP 503 (T-006).
     void evict_for_vram(const server_model_meta & incoming);
 
     // not thread-safe, caller must hold mutex

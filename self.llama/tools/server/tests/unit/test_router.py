@@ -243,6 +243,123 @@ def test_router_vram_aware_evicts_multiple_lru():
             os.remove(fake_vram_file)
 
 
+# ── VRAM-unfittable terminal load error (issue #27, R6 / AC3, AC4) ──────
+#
+# The contrasting happy path -- a resident model IS present, so the incoming
+# load evicts the LRU and succeeds -- is already covered by
+# test_router_vram_aware_evicts_one_lru above (and the multi-eviction case by
+# test_router_vram_aware_evicts_multiple_lru). These two tests cover the
+# terminal case those don't: nothing is left to evict and the model still
+# doesn't fit, which must surface as a specific, structured HTTP 503 (not a
+# generic 500 that would slip through into a real OOM), carrying the model
+# name and both the estimated-footprint and free-VRAM figures so a proxy
+# (self.ai -> self.chat) can forward the reason unchanged.
+
+
+def _prime_estimable_then_unload(model: str, fake_vram_file: str) -> None:
+    """Load `model` once (so its GGUF is cached locally and
+    estimate_model_footprint_bytes() returns non-zero), then unload it so NO
+    resident LOADED model is left for evict_for_vram() to reclaim. Priming
+    while free VRAM is abundant keeps the prime-load itself from tripping the
+    VRAM check. After this returns, starve `fake_vram_file` to force the
+    unfittable path on the next load."""
+    with open(fake_vram_file, "w") as f:
+        f.write("999999")  # abundant room for the prime-load
+    _load_model_and_wait(model, timeout=120)
+    unload_res = server.make_request("POST", "/models/unload", data={"model": model})
+    assert unload_res.status_code == 200
+    assert unload_res.body.get("success") is True
+    _wait_for_model_status(model, {"unloaded"})
+    with open(fake_vram_file, "w") as f:
+        f.write("1")  # starve: smaller than any test model's footprint
+
+
+def _assert_unfittable_503(body, model: str) -> None:
+    """Assert `body` is the structured OpenAI-style error envelope
+    format_error_response()/ex_wrapper produce for the T-004 exception:
+    {"error": {"code": 503, "message": ..., "type": "unavailable_error"}}."""
+    assert isinstance(body, dict), f"expected a JSON error object, got: {body!r}"
+    assert "error" in body, f"expected an 'error' envelope, got: {body!r}"
+    err = body["error"]
+    assert err.get("type") == "unavailable_error", f"unexpected error type: {err!r}"
+    msg = err.get("message", "")
+    # T-004 format_message embeds all three facts AC3 requires
+    assert model in msg, f"error message must name the model, got: {msg!r}"
+    assert "does not fit in VRAM" in msg, f"unexpected error wording: {msg!r}"
+    assert "estimated" in msg, f"error message must report an estimated footprint, got: {msg!r}"
+    assert "MiB" in msg, f"error message must report MiB figures, got: {msg!r}"
+    assert "is free" in msg, f"error message must report the free-VRAM figure, got: {msg!r}"
+
+
+def test_router_vram_aware_unfittable_load_returns_503():
+    """POST /models/load for an estimable model that cannot fit in free VRAM
+    with NO resident model to evict must return a structured HTTP 503 -- not a
+    generic 500 -- naming the model plus its estimated footprint and the free
+    VRAM (issue #27, R6/AC3, AC4). The load is invoked synchronously inside
+    the ex_wrapper-wrapped handler, so evict_for_vram()'s throw becomes the
+    HTTP response rather than a background failure."""
+    global server
+    server.models_max = 4  # high enough that count-based eviction never interferes
+    fake_vram_file = os.path.join(TMP_DIR, "test_router_unfittable_free_vram_mb.txt")
+    server.fake_free_vram_mb_file = fake_vram_file
+    server.start()
+
+    try:
+        model = VRAM_CANDIDATE_MODELS[0]
+        _prime_estimable_then_unload(model, fake_vram_file)
+
+        res = server.make_request("POST", "/models/load", data={"model": model})
+
+        # AC3: a specific error, not a generic 500
+        assert res.status_code == 503, \
+            f"expected 503 for an unfittable load, got {res.status_code}: {res.body}"
+        # AC4: structured envelope a proxy can forward, carrying all three facts
+        _assert_unfittable_503(res.body, model)
+
+        # the throw happens before any child instance is created, so the model
+        # must be left UNLOADED (not stuck LOADING / half-loaded)
+        assert _get_model_status(model) == "unloaded"
+    finally:
+        if os.path.exists(fake_vram_file):
+            os.remove(fake_vram_file)
+
+
+def test_router_vram_aware_unfittable_autoload_chat_returns_503():
+    """The same terminal 503 must surface through the autoload path used by
+    /v1/chat/completions (router_validate_model -> ensure_model_ready ->
+    load), not only the explicit /models/load handler -- both go through the
+    single ex_wrapper catch (T-006). A chat request that triggers an
+    unfittable autoload must return the structured 503, not a generic 500."""
+    global server
+    server.models_max = 4
+    fake_vram_file = os.path.join(TMP_DIR, "test_router_unfittable_autoload_free_vram_mb.txt")
+    server.fake_free_vram_mb_file = fake_vram_file
+    server.start()
+
+    try:
+        model = VRAM_CANDIDATE_MODELS[0]
+        _prime_estimable_then_unload(model, fake_vram_file)
+
+        res = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+
+        assert res.status_code == 503, \
+            f"expected 503 for an unfittable autoload, got {res.status_code}: {res.body}"
+        _assert_unfittable_503(res.body, model)
+
+        assert _get_model_status(model) == "unloaded"
+    finally:
+        if os.path.exists(fake_vram_file):
+            os.remove(fake_vram_file)
+
+
 def test_router_vram_aware_disabled_does_not_evict():
     """--no-models-vram-aware turns the new eviction layer off entirely:
     models_max is still the (only) limit, so a tiny (fake) free-VRAM

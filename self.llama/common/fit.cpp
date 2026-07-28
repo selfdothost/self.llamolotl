@@ -173,6 +173,21 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// Clamp the high bound of GPU layers a single device may take to a user/config-set ceiling.
+// A negative ceiling is the sentinel for "auto / unset" and leaves the bound unchanged, so
+// the fill loop keeps assigning as many layers as fit in VRAM. When a ceiling is present the
+// bound is capped to it, so the fit-to-VRAM search treats a config-set n_gpu_layers as an
+// upper limit it may reduce from rather than an exact pin. Pure/side-effect-free so the
+// ceiling-not-pin decision can be unit tested without a GPU or device-memory query.
+// Declared in fit.h (not file-static) so the T-002 unit test can link against it; behaviour
+// is unchanged from the file-static original.
+uint32_t common_fit_clamp_ngl_ceiling(uint32_t n_unassigned_high, int64_t ngl_ceiling) {
+    if (ngl_ceiling < 0) {
+        return n_unassigned_high;
+    }
+    return std::min(n_unassigned_high, uint32_t(ngl_ceiling));
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -188,6 +203,11 @@ static void common_params_fit_impl(
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+
+    // A user/config-set n_gpu_layers is treated as a ceiling the fit-to-VRAM fill loop may
+    // reduce from, not an exact pin that aborts the fallback. -1 => no ceiling (auto offload).
+    // Only populated for the single-device dense path (see the throw site below).
+    int64_t ngl_ceiling = -1;
 
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
@@ -373,7 +393,19 @@ static void common_params_fit_impl(
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        // Treat a concrete, config-set n_gpu_layers as a fallback ceiling rather than a hard
+        // pin, but only on the single-device dense path (nd == 1, hp_nex == 0) that
+        // self.llamolotl actually runs. Capture the ceiling and reset n_gpu_layers to the
+        // default so the "only modify default-valued params" invariants below and
+        // set_ngl_tensor_split_tbo still hold; the ceiling is re-applied when clamping the
+        // back-to-front fill loop (step 3). hp_ngl stays the true model layer count.
+        // Multi-device / MoE weight reduction is out of scope and still aborts as before.
+        if (nd == 1 && hp_nex == 0 && mparams->n_gpu_layers >= 0) {
+            ngl_ceiling = mparams->n_gpu_layers;
+            mparams->n_gpu_layers = default_mparams.n_gpu_layers;
+        } else {
+            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        }
     }
     if (nd > 1) {
         if (!tensor_split) {
@@ -583,7 +615,12 @@ static void common_params_fit_impl(
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
     }
     for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
+        // Cap the high bound to a config-set ceiling (no-op when ngl_ceiling < 0, which is
+        // always the case for the multi-device / MoE paths that never set it). The remaining
+        // layers stay on CPU via the existing overflow tensor_buft_overrides, and the
+        // reduce-to-fit interpolation below lowers offload further if the ceiling itself
+        // doesn't fit.
+        uint32_t n_unassigned = common_fit_clamp_ngl_ceiling(hp_ngl + 1, ngl_ceiling);
         for (size_t jd = id + 1; jd < nd; ++jd) {
             assert(n_unassigned >= ngl_per_device[jd].n_layer);
             n_unassigned -= ngl_per_device[jd].n_layer;

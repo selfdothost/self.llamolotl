@@ -20,12 +20,17 @@ from ..state import (
     ChatTemplateUploadRequest,
     HealthResponse,
     JobStatus,
+    VramReleaseRequest,
+    VramReleaseResponse,
+    VramStateResponse,
     _check_api_liveness,
     _check_disk,
     _check_gpu,
     _check_inference_health,
     _get_active_loras_from_server,
+    _handle_vram_release,
     _jobs,
+    _probe_vram_state,
     _restart_llama_server,
 )
 
@@ -220,6 +225,77 @@ def get_active_loras(_auth=Depends(require_scope("system:read"))):
             i += 1
 
     return {"loras": loras, "source": "args-file"}
+
+
+# ─── GPU-Lease Protocol (cavekit gpu-lease-client) ───────────────────
+# self.llamolotl's side of the cross-service VRAM-lease protocol brokered by
+# core (self.ai). R1 reports held/total VRAM so core's lease registry can
+# track this instance; R2 answers a release-request via whole-model eviction.
+
+@router.get("/api/system/vram-state")
+def vram_state(_auth=Depends(require_scope("system:read"))) -> VramStateResponse:
+    """Report currently-held VRAM and total addressable capacity, in bytes
+    (cavekit gpu-lease-client R1 — T-003).
+
+    Gated with the existing `system:read` scope (per the kit: no new scope is
+    needed — this is read-only health-adjacent state, the same taxonomy slot
+    the chat-template/active-lora reads already use).
+
+    Calls `_probe_vram_state()`, which computes the figures live on every call
+    (never cached — R1-AC2). The result is marshalled straight through into
+    `VramStateResponse`: when a source is unreachable the probe returns `None`
+    for held/capacity and that flows through as JSON `null` with
+    `status="unreachable"` — deliberately NOT defaulted to 0 (R1-AC4), so a
+    caller can distinguish "reachable, genuinely near-zero" (R1-AC3) from
+    "unreachable, unknown". This endpoint therefore always returns 200 even
+    when the GPU/router is unreachable: the distinguishable signal lives in the
+    body's `status`/`*_reachable` fields, not in an HTTP error that would hide
+    it.
+    """
+    probe = _probe_vram_state()
+    # The currently-resident model, from the same helper `/health` uses (router
+    # mode keeps ≤1 loaded; None when none is resident or the router is
+    # unreachable). Surfaced so core's VRAM-state poller can relay it into the
+    # lease registry for the chat eval-coexist route (self.ai!225 T-000-VS).
+    _inference_healthy, loaded_model = _check_inference_health()
+    return VramStateResponse(
+        held_vram_bytes=probe["held_vram_bytes"],
+        total_capacity_bytes=probe["total_capacity_bytes"],
+        gpu_reachable=probe["gpu_reachable"],
+        router_reachable=probe["router_reachable"],
+        resident_model_count=probe["resident_model_count"],
+        status=probe["status"],
+        loaded_model=loaded_model,
+    )
+
+
+@router.post("/api/system/vram-release")
+def vram_release(
+    req: VramReleaseRequest, _auth=Depends(require_scope("system:write"))
+) -> VramReleaseResponse:
+    """Answer a release-request by evicting whole models until ~target_bytes is
+    freed, or the timeout is hit, or nothing more is safely evictable (cavekit
+    gpu-lease-client R2 — T-008).
+
+    Gated with the existing `system:write` scope — reused deliberately rather
+    than minting a new one: this is a runtime control-plane mutation, the same
+    class as `apply-loras` (which already uses `system:write`), and a distinct
+    scope would require a coordinated change to self.ai's ticket-minting side
+    (`service_auth.py`) that is explicitly out of scope here.
+
+    Delegates the whole sequence — single-flight guard, LRU/stable-LOADED
+    selection, timeout-bounded eviction, and live post-eviction verification —
+    to `_handle_vram_release()`. A `"busy"` result (another release already in
+    flight, R2-AC6) is surfaced as HTTP 409 so a racing caller gets an
+    unambiguous signal rather than a misleading 200-with-zero.
+    """
+    result = _handle_vram_release(req.target_bytes, req.timeout_seconds)
+    if result.status == "busy":
+        raise HTTPException(
+            status_code=409,
+            detail="A VRAM release-request is already in flight on this instance",
+        )
+    return result
 
 
 # ─── Health Endpoints ─────────────────────────────────────────────────
