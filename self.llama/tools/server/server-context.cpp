@@ -4065,6 +4065,7 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* device_memory          */ common_get_context_device_memory(impl->ctx_tgt),
     };
 }
 
@@ -5159,6 +5160,28 @@ json server_routes::get_model_info() const {
             {"size",        meta->model_size},
             {"ftype",       meta->model_ftype},
         }},
+        // Measured per-device footprint, published so the router can size
+        // eviction and admission from what this model cost rather than from
+        // its file size (self.llamolotl#36). Reported on the ready
+        // notification, so the router learns the true cost of every
+        // configuration it has ever loaded -- and the same number answers
+        // "how much would we free by unloading this" (self.llamolotl#35).
+        {"memory",   [&]() {
+            json devices = json::array();
+            for (const auto & dev : meta->device_memory) {
+                devices.push_back({
+                    {"name",        dev.name},
+                    {"description", dev.description},
+                    {"total",       dev.total},
+                    {"free",        dev.free},
+                    {"model",       dev.model},
+                    {"context",     dev.context},
+                    {"compute",     dev.compute},
+                    {"self",        (uint64_t) dev.model + dev.context + dev.compute},
+                });
+            }
+            return devices;
+        }()},
     };
 }
 

@@ -3364,9 +3364,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_VRAM_MARGIN_MB"));
     add_opt(common_arg(
         {"--models-vram-overhead-pct"}, "N",
-        string_format("for router server, percent overhead added on top of a model's on-disk GGUF size to "
-                       "approximate its resident VRAM footprint (KV cache + compute buffers) for VRAM-aware "
-                       "eviction (default: %d)", params.models_vram_overhead_pct),
+        string_format("DEPRECATED, no longer consulted. The router used to size a model by its on-disk "
+                       "GGUF size inflated by this percentage, which was blind to -ncmoe/-ngl and so refused "
+                       "expert-offloaded models that fit; it now uses the footprint a child measures about "
+                       "itself once loaded. Accepted for compatibility, ignored (default: %d)",
+                       params.models_vram_overhead_pct),
         [](common_params & params, int value) {
             params.models_vram_overhead_pct = value;
         }
@@ -4420,6 +4422,22 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    // Deliberately a STRING handler even though the value is a number.
+    // common_preset::apply_to_params() runs every option's handler, preset-only
+    // ones included, and handler_int puts the raw value through std::stoi() --
+    // so a typo in a hand-edited preset would throw out of preset loading
+    // instead of being ignored. The consumer (declared_footprint_bytes() in
+    // tools/server/server-models.cpp) parses it defensively and treats anything
+    // unusable as no claim at all, which is the behaviour a footprint hint
+    // should have: it must never be able to stop the router from starting.
+    args.push_back(common_arg(
+        {"vram-footprint-mib"}, "MIB",
+        "in server router mode, how much VRAM this model configuration occupies once loaded, in MiB. "
+        "Seeds the VRAM-aware admission check for a configuration this router process has not measured "
+        "yet; a real measurement from a loaded child always wins over it",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

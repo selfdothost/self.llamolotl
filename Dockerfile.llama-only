@@ -8,7 +8,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential cmake git libssl-dev libgomp1 && \
+        build-essential cmake git libssl-dev libgomp1 python3 python3-pip && \
     rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
 
 WORKDIR /llama-src
@@ -55,6 +55,39 @@ RUN echo "========== CHECKING BUILD ARTIFACTS ==========" && \
     ldd build/bin/llama-server 2>&1 || echo "ldd failed - checking nm instead" && \
     nm build/bin/llama-server | grep -i cuda | head -20
 
+# Prime the pytest server test suite's model cache at build time, while
+# kaniko still has network egress, instead of re-downloading every CI run.
+# tools/server/tests/conftest.py's autouse `do_something` fixture calls
+# ServerPreset.load_all() before any test runs, which starts+stops every
+# fixture model (tinyllama2, bert_bge_small(_with_fa), tinyllama_infill,
+# stories15m_moe, jina_reranker_tiny, tinygemma3, router) to force-download
+# each into $LLAMA_CACHE. With a fresh, unpersisted LLAMA_CACHE every
+# pipeline run (no GitLab `cache:` backend wired in for this runner -- see
+# .gitlab-ci.yml), that's ~7 HF downloads from a cold cache on every test
+# job -- one of which (bert-bge-small, ~130MB) didn't finish inside the
+# 60s per-model start() timeout and failed the whole suite before a single
+# real test ran. Run the same priming call here instead, once, and ship
+# the populated cache in the image; .gitlab-ci.yml points LLAMA_CACHE at
+# /opt/llama-cache (this cache's destination below) instead of the
+# ephemeral checkout dir, so the test job's load_all() call is a cache hit
+# for all seven and only downloads anything if a preset actually changes.
+# LD_LIBRARY_PATH needs the CUDA stub dir here (this build stage's base
+# image has no real libcuda.so.1 either -- see the note on the /app/lib
+# copy below for why) purely so the priming binary can start at all. The
+# stub file itself is named libcuda.so (unversioned) -- ld.so resolves
+# DT_NEEDED entries by exact SONAME, so a bare `libcuda.so` on the search
+# path does NOT satisfy a lookup for `libcuda.so.1` (that's link-time -l
+# resolution, a different mechanism). Symlink the versioned name in first.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+RUN cd tools/server/tests && pip3 install --no-cache-dir -r requirements.txt
+RUN mkdir -p /build-llama-cache && \
+    cd tools/server/tests && \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" \
+    LLAMA_SERVER_BIN_PATH=/llama-src/build/bin/llama-server \
+    LLAMA_CACHE=/build-llama-cache \
+    python3 -c "from utils import ServerPreset; ServerPreset.load_all()" && \
+    du -sh /build-llama-cache
+
 RUN mkdir -p /app/lib && \
     cp build/bin/llama-server /app/llama-server && \
     cp build/bin/llama-bench /app/llama-bench && \
@@ -62,6 +95,18 @@ RUN mkdir -p /app/lib && \
     # link them at runtime. Carry them into the runtime image (-P keeps the
     # versioned .so symlinks).
     cp -P build/bin/*.so* /app/lib/ && \
+    # GGML_CUDA=ON links against the stub libcuda (via -L.../stubs) so the
+    # binary builds with a DT_NEEDED on libcuda.so.1 -- but the stub itself
+    # was never carried into the runtime image. On a real GPU host, the
+    # nvidia container runtime injects the driver's own libcuda.so.1, so
+    # this was masked there; on a GPU-less runner (CI) the dynamic linker
+    # has nothing to resolve libcuda.so.1 against and llama-server dies at
+    # load time (exit 127) before main() ever runs ggml's own CUDA-init
+    # fallback. This image (llama-only) is CI-test-only -- production
+    # tracks the Dockerfile-built image, see .gitlab-ci.yml -- so shipping
+    # the build-time stub as libcuda.so.1 here is safe and lets the linker
+    # resolve it, which is what actually lets the CPU-fallback path run.
+    cp /usr/local/cuda/lib64/stubs/libcuda.so /app/lib/libcuda.so.1 && \
     ls -lah /app/lib/
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
@@ -89,6 +134,9 @@ RUN echo "========== RUNTIME ENVIRONMENT ==========" && \
 COPY --from=0 /app/llama-server /app/llama-server
 COPY --from=0 /app/llama-bench /app/llama-bench
 COPY --from=0 /app/lib /app/lib
+# Pre-warmed server-test model cache (see the priming RUN in the build
+# stage above). .gitlab-ci.yml sets LLAMA_CACHE=/opt/llama-cache to match.
+COPY --from=0 /build-llama-cache /opt/llama-cache
 
 ENV LD_LIBRARY_PATH=/app/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 WORKDIR /app

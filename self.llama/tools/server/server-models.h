@@ -202,6 +202,44 @@ private:
         std::unordered_map<std::string, std::string> map;
     };
 
+    // Measured VRAM footprint per model CONFIGURATION (issue #36), in bytes.
+    //
+    // Keyed by the model's effective launch options, NOT by its name: the same
+    // GGUF at n-cpu-moe=40 and at n-cpu-moe=25 occupies wildly different
+    // amounts of card, so a cache keyed on identity alone would reproduce the
+    // bug it exists to replace. An absent entry means "this configuration has
+    // never been loaded here", which is not the same as zero and must not be
+    // treated as it -- see lookup_measured_footprint().
+    //
+    // Populated from what the child measures about itself once it is ready, so
+    // it is lost on router restart and re-learned on first load. That is
+    // deliberate: a footprint that survived a restart could outlive the driver,
+    // the build, or the card it was measured on.
+    //
+    // The cost of that choice is the window before the first load of each
+    // configuration, where a split (-ncmoe / -ot) model has no admission check
+    // at all -- see #39. A preset may carry vram-footprint-mib to cover the
+    // window; an entry here always outranks it.
+    std::map<std::string, int64_t> measured_footprints;
+
+    // Stable identity for the cache above: the effective preset with the
+    // per-instance HOST/PORT/ALIAS injections update_args() adds stripped back
+    // out, so two launches of the same configuration hash the same.
+    static std::string footprint_key(const server_model_meta & meta);
+
+    // Record what a now-ready child reported about itself. Caller must hold mutex.
+    void record_measured_footprint(const server_model_meta & meta);
+
+    // Measured footprint for this configuration, or nullopt if never loaded.
+    // Caller must hold mutex.
+    std::optional<int64_t> lookup_measured_footprint(const server_model_meta & meta);
+
+    // How big a configuration is, in bytes, or 0 for unknown: measured, else
+    // declared via vram-footprint-mib (#39), else the file-size estimate, else
+    // unknown. The single sizing rule for evict_for_vram(), so an incoming model
+    // and the resident ones are never sized differently. Caller must hold mutex.
+    int64_t footprint_bytes(const server_model_meta & meta);
+
     common_preset_context ctx_preset;
 
     common_params base_params;
@@ -215,11 +253,11 @@ private:
     void unload_lru();
 
     // VRAM-aware supplement to unload_lru() (issue #22): evict LRU resident model(s), if any,
-    // until the incoming model's estimated VRAM footprint (+ safety margin) fits in currently
+    // until the incoming model's MEASURED VRAM footprint (+ safety margin) fits in currently
     // free GPU memory, or until there's nothing left it's safe to evict. Best-effort and
     // conservative: no-ops (falls back to the models_max count-based limit only) if free VRAM
-    // can't be queried or the incoming model's footprint can't be estimated -- see the
-    // implementation comment in server-models.cpp for why and its limitations.
+    // can't be queried or this configuration has never been loaded here, so its footprint is
+    // unknown -- see the implementation comment in server-models.cpp for why and its limitations.
     // Terminal case (issue #27): if nothing is left it's safe to evict and the incoming model
     // still won't fit, this THROWS server_model_vram_unfittable_error (above) rather than
     // letting the load proceed into an OOM; ex_wrapper maps it to a structured HTTP 503 (T-006).

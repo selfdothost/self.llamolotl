@@ -197,11 +197,24 @@ class VramStateResponse(BaseModel):
     the probe's `None` straight through to `null` rather than defaulting to 0.
 
     Field units/meanings (documented per R1-AC5 for direct parse):
-    - held_vram_bytes:     bytes of GPU memory currently in use on the device
-                           (from `nvidia-smi memory.used`), computed live per
-                           call, never cached (R1-AC2). Near-zero (a real int,
-                           not null) when no models are resident (R1-AC3);
-                           `null` only when the GPU is unreachable (R1-AC4).
+    - held_vram_bytes:     bytes of GPU memory THIS SERVICE is holding, summed
+                           from the footprints of the models the router reports
+                           stably loaded. Computed live per call, never cached
+                           (R1-AC2). A real int 0 when the router answers and
+                           nothing is resident (R1-AC3); `null` only when the
+                           router did not answer, i.e. genuinely unknown
+                           (R1-AC4). It is NOT the whole card — see
+                           device_used_bytes. Core SUMS this field across
+                           consumers, so reporting the card here double-counted
+                           every sibling (self.ai#74).
+    - device_used_bytes:   bytes in use on the WHOLE DEVICE, every process
+                           included (from `nvidia-smi memory.used`) — the figure
+                           held_vram_bytes used to carry. Reported separately so
+                           core can account for CUDA contexts and processes that
+                           are not lease consumers, WITHOUT summing it. `null`
+                           when the GPU is unreachable.
+    - device_total_bytes:  total addressable device VRAM in bytes accompanying
+                           device_used_bytes; `null` when the GPU is unreachable.
     - total_capacity_bytes: total addressable device VRAM in bytes
                            (from `nvidia-smi memory.total`); `null` when the
                            GPU is unreachable.
@@ -218,8 +231,12 @@ class VramStateResponse(BaseModel):
                            — the discriminator a caller keys on instead of
                            trusting a held value.
     """
-    held_vram_bytes: Optional[int] = None  # null (not 0) when GPU unreachable
+    held_vram_bytes: Optional[int] = None  # null (not 0) when the router is unreachable
     total_capacity_bytes: Optional[int] = None  # null when GPU unreachable
+    # self.ai#74: the WHOLE card, every process. A different quantity from
+    # held_vram_bytes and never to be summed across consumers.
+    device_used_bytes: Optional[int] = None  # null when GPU unreachable
+    device_total_bytes: Optional[int] = None  # null when GPU unreachable
     gpu_reachable: bool
     router_reachable: bool
     resident_model_count: Optional[int] = None
@@ -1127,6 +1144,140 @@ def _probe_gpu_memory_bytes() -> tuple:
     return False, None, None
 
 
+def _router_resident_footprints():
+    """[(model_name, footprint_bytes|None)] for every stably-LOADED model.
+
+    The footprint is the one the model MEASURED ABOUT ITSELF and published on
+    the router's ``GET /v1/models`` (``memory[]``, one entry per device, added
+    in self.llamolotl!41 for #36): summed model + context + compute across
+    devices. Host memory is already excluded on that side, which is the whole
+    point -- weights ``-ncmoe`` pushed into system RAM are not holding the card.
+
+    ``None`` for a loaded model that published no measurement (a router
+    predating !41, or a wake-from-sleep that reported no payload). The caller
+    decides what an unmeasured resident model means; it must never be read as
+    zero.
+    """
+    models = _probe_llama_server_models_status()
+    if models is None:
+        return None
+
+    resident = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        # Stable-LOADED only, the same eligibility _select_models_to_evict()
+        # applies: a "loading"/"sleeping"/"unloaded" model is not a settled
+        # holding we should be reporting as held.
+        if (entry.get("status") or {}).get("value") != "loaded":
+            continue
+        name = entry.get("id")
+        if not name:
+            continue
+
+        devices = entry.get("memory")
+        if not isinstance(devices, list) or not devices:
+            resident.append((name, None))
+            continue
+
+        total = 0
+        for dev in devices:
+            if not isinstance(dev, dict):
+                continue
+            for key in ("model", "context", "compute"):
+                value = dev.get(key)
+                if isinstance(value, int):
+                    total += value
+        resident.append((name, total))
+
+    return resident
+
+
+def _self_attributed_held_bytes():
+    """VRAM THIS service is holding, attributed to itself (self.ai#74, #35).
+
+    Returns ``(held_bytes|None, attributed_all)``.
+
+    WHAT CHANGED AND WHY (#35). This used to sum each loaded model's on-disk
+    GGUF size from the models-meta sidecar, which ``_record_model_meta()``
+    writes only when llamolotl itself pulled the file. Six of the ten models on
+    this deployment's volume were never pulled that way, so they had no recorded
+    size, contributed nothing, and the function returned **0 while the card held
+    14.5 GiB** -- indistinguishable on the wire from "nothing is resident".
+
+    Worse, file size is not the GPU footprint at all once weights are split
+    between card and system RAM: measured on the live 4090, GLM-4.5-Air-q8_0 is
+    109.39 GiB on disk and 21.33 GiB resident at ``n-cpu-moe=40``. Repairing the
+    sidecar lookup would have replaced a zero with a number 6x too large.
+
+    So the figure now comes from what each model measured about itself and
+    published on the router (see ``_router_resident_footprints()``). That is the
+    same number the router uses to size eviction, so core and the router can no
+    longer disagree about what a model costs.
+
+    STRICTNESS: if ANY resident model published no measurement, this returns
+    ``None`` (unknown) rather than a partial sum. A partial understates what we
+    hold, and core subtracts held from capacity to decide what is grantable --
+    understating it is the direction that over-grants, and over-granting a
+    single shared card means OOM. Unknown leaves core on its last reading, which
+    is conservative; a low number does not.
+    """
+    resident = _router_resident_footprints()
+    if resident is None:
+        return (None, True)
+
+    total = 0
+    attributed_all = True
+    for name, footprint in resident:
+        if footprint is None:
+            log.warning(
+                "vram-state: resident model %s published no measured footprint; "
+                "reporting held as unknown rather than understating it",
+                name,
+            )
+            attributed_all = False
+            continue
+        total += footprint
+
+    if not attributed_all:
+        return (None, False)
+
+    # An empty loaded set is a KNOWABLE zero (the router answered and nothing is
+    # resident), distinct from the None above.
+    return (total, True)
+
+
+def _primary_loaded_model():
+    """The resident model core should treat as "the one that is loaded", or None.
+
+    Router mode can hold several at once (``MODELS_MAX``), typically one large
+    chat/code model alongside a tiny embedder and reranker, but the lease
+    registry carries a single ``loaded_model_id`` and its consumer -- the chat
+    admission checkpoint -- wants the model an incoming request could be served
+    by instead of forcing a competing load. That is the big one, so pick the
+    largest by measured footprint.
+
+    Ranking by footprint only became possible with #36's measurements; the
+    router's ``/v1/models`` exposes no last-used timestamp to rank by instead.
+
+    This replaces reading ``/health``, which never worked: this fork's health
+    endpoint returns a bare ``{"status": "ok"}`` with no model field in either
+    mode, so ``loaded_model`` was structurally always null and the registry
+    column has been empty since it was added.
+    """
+    resident = _router_resident_footprints()
+    if not resident:
+        return None
+
+    measured = [(name, size) for name, size in resident if size is not None]
+    if measured:
+        return max(measured, key=lambda pair: pair[1])[0]
+
+    # Nothing measured (pre-!41 router): a name is still better than nothing for
+    # the admission path, which only compares identity.
+    return resident[0][0]
+
+
 def _probe_vram_state() -> dict:
     """Live held-VRAM + total-capacity introspection for the GPU-lease
     broker (cavekit gpu-lease-client R1). Computed FRESH on every call — no
@@ -1161,9 +1312,35 @@ def _probe_vram_state() -> dict:
     router_reachable = models is not None
     resident_model_count = len(models) if router_reachable else None
 
+    # self.ai#74: held is OURS, device_used is the CARD. These are different
+    # quantities and core must never sum the second across consumers.
+    #
+    # Still gated on gpu_reachable, deliberately. We could technically answer
+    # "0 held" from the router alone with nvidia-smi down, but an nvidia-smi
+    # failure usually means the driver is shadowed/broken, which is exactly when
+    # the router's view is least trustworthy. Reporting null keeps R1-AC4 intact
+    # and leaves core on llamolotl's last known held (conservative) rather than
+    # dropping it to 0 and freeing capacity that may not exist.
+    if gpu_reachable:
+        held_bytes, attributed_all = _self_attributed_held_bytes()
+    else:
+        held_bytes, attributed_all = (None, True)
+    if held_bytes is not None and not attributed_all:
+        log.debug(
+            "vram-lease: held figure is partial — at least one loaded model has "
+            "no recorded size_bytes; the remainder shows up in device_used_bytes "
+            "and core accounts for it as unattributed overhead"
+        )
+
     return {
-        "held_vram_bytes": used_bytes,
+        # OUR holding, self-attributed from resident model footprints. None when
+        # the router did not answer (unknown), never a false 0.
+        "held_vram_bytes": held_bytes,
         "total_capacity_bytes": total_bytes,
+        # The WHOLE CARD from nvidia-smi — every process, ours and everyone
+        # else's. This is what held_vram_bytes used to (wrongly) carry.
+        "device_used_bytes": used_bytes,
+        "device_total_bytes": total_bytes,
         "gpu_reachable": gpu_reachable,
         "router_reachable": router_reachable,
         "resident_model_count": resident_model_count,
@@ -1832,7 +2009,11 @@ def _handle_vram_release(target_bytes: int, timeout_seconds: float) -> "VramRele
             _wait_for_models_unloaded(evicted_models, deadline)
 
         # Live verification (step 5 / AC4): freed comes from the measured delta,
-        # NEVER from assuming the unload calls above worked.
+        # NEVER from assuming the unload calls above worked. Since self.ai#74
+        # that delta is over OUR self-attributed held (resident model
+        # footprints) rather than whole-card nvidia-smi used — still live and
+        # still re-probed, but now attributable: a sibling consumer allocating
+        # on the shared card mid-unload can no longer understate what WE freed.
         post = _probe_vram_state()
         post_held = post.get("held_vram_bytes")
 

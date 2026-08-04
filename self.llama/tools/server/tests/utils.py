@@ -101,6 +101,18 @@ class ServerProcess:
     # deterministically without real GPU memory pressure
     fake_free_vram_mb: int | None = None
     fake_free_vram_mb_file: str | None = None
+    # test-only: fake TOTAL VRAM capacity in MiB, from a file re-read on every
+    # query. Free VRAM is derived as total - (estimated footprint of resident
+    # models), so an eviction actually raises the next reading. The two hooks
+    # above hold a fixed value and cannot express that, which is why no test
+    # using them can cover eviction succeeding (self.llamolotl#34).
+    fake_total_vram_mb_file: str | None = None
+    # test-only: the per-device footprint a loaded child would have reported, in
+    # MiB. CI runs against a stub CUDA driver, so children report "memory": []
+    # and every measurement is 0 -- which makes any test of "a measurement
+    # outranks something" unsatisfiable rather than merely failing. Only used
+    # when the child's own payload sums to nothing (self.llamolotl#39).
+    fake_measured_mib: int | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
@@ -190,6 +202,10 @@ class ServerProcess:
             env["LLAMA_TEST_FAKE_FREE_VRAM_MB"] = str(self.fake_free_vram_mb)
         if self.fake_free_vram_mb_file is not None:
             env["LLAMA_TEST_FAKE_FREE_VRAM_MB_FILE"] = self.fake_free_vram_mb_file
+        if self.fake_total_vram_mb_file is not None:
+            env["LLAMA_TEST_FAKE_TOTAL_VRAM_MB_FILE"] = self.fake_total_vram_mb_file
+        if self.fake_measured_mib is not None:
+            env["LLAMA_TEST_FAKE_MEASURED_MIB"] = str(self.fake_measured_mib)
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
         if self.n_batch:

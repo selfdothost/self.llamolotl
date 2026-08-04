@@ -30,6 +30,7 @@ from ..state import (
     _get_active_loras_from_server,
     _handle_vram_release,
     _jobs,
+    _primary_loaded_model,
     _probe_vram_state,
     _restart_llama_server,
 )
@@ -253,14 +254,20 @@ def vram_state(_auth=Depends(require_scope("system:read"))) -> VramStateResponse
     it.
     """
     probe = _probe_vram_state()
-    # The currently-resident model, from the same helper `/health` uses (router
-    # mode keeps ≤1 loaded; None when none is resident or the router is
-    # unreachable). Surfaced so core's VRAM-state poller can relay it into the
-    # lease registry for the chat eval-coexist route (self.ai!225 T-000-VS).
-    _inference_healthy, loaded_model = _check_inference_health()
+    # The resident model core should treat as "the loaded one", ranked by
+    # measured footprint (self.llamolotl#35). Previously this read
+    # _check_inference_health(), which takes the model name off llama-server's
+    # /health -- and this fork's /health returns a bare {"status": "ok"} with no
+    # model field in either mode, so the value was structurally always None and
+    # the registry's loaded_model_id column has been empty since it was added.
+    # Surfaced so core's VRAM-state poller can relay it into the lease registry
+    # for the chat eval-coexist route (self.ai!225 T-000-VS).
+    loaded_model = _primary_loaded_model()
     return VramStateResponse(
         held_vram_bytes=probe["held_vram_bytes"],
         total_capacity_bytes=probe["total_capacity_bytes"],
+        device_used_bytes=probe["device_used_bytes"],
+        device_total_bytes=probe["device_total_bytes"],
         gpu_reachable=probe["gpu_reachable"],
         router_reachable=probe["router_reachable"],
         resident_model_count=probe["resident_model_count"],

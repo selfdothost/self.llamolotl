@@ -38,26 +38,39 @@ def _smi(used_mib, total_mib):
 # ─── T-001: _probe_vram_state ────────────────────────────────────────────
 
 class TestProbeVramState:
-    def test_models_resident_and_gpu_used(self):
-        """(a) models resident + nvidia-smi used>0 → held>0, capacity>0, both reachable."""
+    def test_models_resident_reports_our_held_not_the_whole_card(self):
+        """(a) models resident → held is OUR summed model footprint, and the
+        whole-card figure is reported separately as device_used_bytes.
+
+        The two numbers are deliberately different here (3000 MiB vs 4096 MiB):
+        core SUMS held across consumers, so reporting the card in that field
+        double-counted every sibling (self.ai#74)."""
         with patch("api.state.subprocess.run", return_value=_smi(4096, 24576)), \
              patch("api.state._probe_llama_server_models_status",
-                   return_value=[{"id": "m1", "status": {"value": "loaded"}}]):
+                   return_value=[{"id": "m1", "status": {"value": "loaded"}}]), \
+             patch("api.state._lookup_model_size_bytes", return_value=3000 * 1024 * 1024):
             s = state._probe_vram_state()
-        assert s["held_vram_bytes"] == 4096 * 1024 * 1024
+        assert s["held_vram_bytes"] == 3000 * 1024 * 1024
+        assert s["device_used_bytes"] == 4096 * 1024 * 1024
+        assert s["held_vram_bytes"] != s["device_used_bytes"]
+        assert s["device_total_bytes"] == 24576 * 1024 * 1024
         assert s["total_capacity_bytes"] == 24576 * 1024 * 1024
         assert s["gpu_reachable"] is True
         assert s["router_reachable"] is True
         assert s["resident_model_count"] == 1
         assert s["status"] == "ok"
 
-    def test_no_models_resident_reports_near_zero_not_null(self):
-        """(b) no models resident + low nvidia-smi used → held near-zero, NOT null (R1-AC3)."""
+    def test_no_models_resident_reports_zero_not_null(self):
+        """(b) router answered and nothing is resident → held is a real 0, NOT
+        null (R1-AC3). The card may still show residual use (contexts, other
+        processes) — that is device_used_bytes' job, not ours."""
         with patch("api.state.subprocess.run", return_value=_smi(12, 24576)), \
              patch("api.state._probe_llama_server_models_status", return_value=[]):
             s = state._probe_vram_state()
-        assert s["held_vram_bytes"] == 12 * 1024 * 1024
+        assert s["held_vram_bytes"] == 0
         assert s["held_vram_bytes"] is not None
+        # Residual card use is still reported — as the card, not as our held.
+        assert s["device_used_bytes"] == 12 * 1024 * 1024
         assert s["router_reachable"] is True
         assert s["resident_model_count"] == 0
         assert s["status"] == "ok"
@@ -79,9 +92,13 @@ class TestProbeVramState:
             s = state._probe_vram_state()
         assert s["router_reachable"] is False
         assert s["resident_model_count"] is None
-        # GPU still reachable → held/capacity still real, status ok.
+        # GPU still reachable → the CARD figures are still real, status ok...
         assert s["gpu_reachable"] is True
         assert s["status"] == "ok"
+        assert s["device_used_bytes"] == 4096 * 1024 * 1024
+        # ...but OUR held is unknown: the router is the only thing that can tell
+        # us what we are holding. Null, never a false 0 (self.ai#74 / R1-AC4).
+        assert s["held_vram_bytes"] is None
 
 
 # ─── T-002 / T-005: wire-format models ───────────────────────────────────
@@ -100,8 +117,9 @@ class TestWireModels:
         assert isinstance(d["held_vram_bytes"], int)
         assert isinstance(d["total_capacity_bytes"], int)
         assert set(d) == {
-            "held_vram_bytes", "total_capacity_bytes", "gpu_reachable",
-            "router_reachable", "resident_model_count", "status", "loaded_model",
+            "held_vram_bytes", "total_capacity_bytes", "device_used_bytes",
+            "device_total_bytes", "gpu_reachable", "router_reachable",
+            "resident_model_count", "status", "loaded_model",
         }
         assert d["loaded_model"] is None  # defaults to null when unset
 
@@ -224,6 +242,9 @@ def _vram(held, total=24576 * 1024 * 1024, gpu_reachable=True):
     return {
         "held_vram_bytes": held,
         "total_capacity_bytes": total if gpu_reachable else None,
+        # self.ai#74: the card reading, separate from this service's held.
+        "device_used_bytes": total if gpu_reachable else None,
+        "device_total_bytes": total if gpu_reachable else None,
         "gpu_reachable": gpu_reachable,
         "router_reachable": True,
         "resident_model_count": 0,

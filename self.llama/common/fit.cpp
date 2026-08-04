@@ -849,6 +849,53 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+std::vector<common_ctx_device_memory> common_get_context_device_memory(const llama_context * ctx) {
+    const auto * model = llama_get_model(ctx);
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        devices.push_back(llama_model_get_device(model, i));
+    }
+
+    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+
+    // Same attribution the breakdown printer does: a buffer type belongs to a
+    // device unless it is host memory, which is deliberately dropped here --
+    // weights pushed to system RAM (-ncmoe, a partial -ngl) are precisely what
+    // this is meant NOT to count against the card.
+    std::vector<common_ctx_device_memory> ret(devices.size());
+    for (size_t i = 0; i < devices.size(); i++) {
+        ret[i].name        = ggml_backend_dev_name(devices[i]);
+        ret[i].description = ggml_backend_dev_description(devices[i]);
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_dev_memory(devices[i], &dev_free, &dev_total);
+        ret[i].free  = (int64_t) dev_free;
+        ret[i].total = (int64_t) dev_total;
+    }
+
+    for (const auto & buft_mb : memory_breakdown) {
+        ggml_backend_buffer_type_t          buft = buft_mb.first;
+        const llama_memory_breakdown_data & mb   = buft_mb.second;
+        if (ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            continue;
+        }
+        for (size_t i = 0; i < devices.size(); i++) {
+            if (devices[i] == dev) {
+                ret[i].model   += mb.model;
+                ret[i].context += mb.context;
+                ret[i].compute += mb.compute;
+                break;
+            }
+        }
+    }
+
+    return ret;
+}
+
 void common_memory_breakdown_print(const struct llama_context * ctx) {
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);

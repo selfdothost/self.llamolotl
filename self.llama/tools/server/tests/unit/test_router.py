@@ -1,3 +1,4 @@
+import re
 import threading
 import pytest
 from utils import *
@@ -159,12 +160,28 @@ def test_router_models_max_evicts_lru():
 # real GPU memory pressure -- CI may run these router tests on GPU-less
 # hosts with no nvidia-smi at all. See ServerProcess.fake_free_vram_mb(_file)
 # in tests/utils.py for how that's plumbed through.
+#
+# Those two hooks return a FIXED reading, which is enough for every test that
+# only needs free VRAM to be abundant or hopeless. It is not enough for the
+# two eviction tests further down: a fixed reading does not go up when a model
+# is evicted, so no eviction can ever make room. Those use a third hook,
+# LLAMA_TEST_FAKE_TOTAL_VRAM_MB_FILE, which fakes capacity and lets the server
+# derive free VRAM from what is resident. See the note above them.
 
+# Every entry must be one of the presets the router has CACHED -- the test
+# server runs --offline, so anything it would have to fetch answers 404 to
+# /models/load. "ggml-org/test-model-router-download:F16" used to sit at the
+# end of this list and is exactly that case; it is the download fixture, it is
+# not among the six cached presets, and it 404'd for every test that touched
+# it. Removed rather than fixed: nothing here needs a downloadable model.
+# Order matters -- test_router_models_max_still_evicts_with_vram_awareness_enabled
+# takes [:3], and the eviction tests below take the largest/smallest by
+# measured footprint rather than by position.
 VRAM_CANDIDATE_MODELS = [
     "ggml-org/tinygemma3-GGUF:Q8_0",
     "ggml-org/test-model-stories260K:F32",
     "ggml-org/test-model-stories260K-infill:F32",
-    "ggml-org/test-model-router-download:F16",
+    "ggml-org/stories15M_MOE:F16",
 ]
 
 
@@ -187,6 +204,80 @@ def test_router_vram_aware_load_fits_without_eviction():
     assert _get_model_status(second) == "loaded"
 
 
+# ── Eviction that actually succeeds (self.llamolotl#34) ────────────────
+#
+# The two tests below need something the fixed-value fakes above cannot give
+# them: a free-VRAM reading that RISES when a model is evicted. With a fixed
+# fake, evict_for_vram()'s loop re-queries the same number every iteration, so
+# no eviction ever makes room -- it runs itself out of candidates and throws
+# the #27 unfittable 503 instead of loading. That is what made these two
+# unsatisfiable before (self.llamolotl#34), and CI deselected them.
+#
+# LLAMA_TEST_FAKE_TOTAL_VRAM_MB_FILE fixes that by faking *capacity* instead of
+# free space: the server derives free = total - (estimated footprint of the
+# models currently resident), so unloading one genuinely gives the next query
+# more room, the way a real driver does.
+#
+# Both tests then have to place `total` inside a window only as wide as the
+# model an eviction frees. Two things make that robust rather than a set of
+# magic MiB constants:
+#
+#   * the footprints are MEASURED off the server itself (_prime_and_measure),
+#     never hardcoded, so swapping a test model cannot silently invalidate the
+#     arithmetic -- it either still works or fails an explicit assert;
+#   * --models-vram-overhead-pct is turned up so every footprint is inflated
+#     well clear of the 1 MiB truncation in the reported figures. The smallest
+#     test models are ~1 MiB on disk, which leaves no room to aim between; at
+#     10x they are tens of MiB and the window is wide. The overhead percentage
+#     is applied uniformly, so the RELATIVE sizes the tests reason about are
+#     unchanged.
+#
+# --models-vram-margin-mb is set to 0 for the same reason: the margin is a
+# constant added to every comparison, and it is exercised by the tests above.
+# Zeroing it here keeps the capacity arithmetic exact.
+
+VRAM_TEST_OVERHEAD_PCT = 900  # 10x on-disk size; see the note above
+
+
+def _write_total_vram_mb(path: str, mib: int) -> None:
+    with open(path, "w") as f:
+        f.write(str(mib))
+
+
+def _prime_and_measure(model: str, total_file: str) -> int:
+    """Cache `model` locally and return the server's OWN estimated footprint
+    for it, in MiB.
+
+    Both steps are load-bearing. The prime-load with abundant capacity is what
+    puts the GGUF in LLAMA_CACHE: estimate_model_footprint_bytes() resolves an
+    HF-repo preset offline, so a model that has never been fetched estimates as
+    0 ("unknown", self.llamolotl#31) and no VRAM arithmetic is possible. Then,
+    with nothing resident, a load against a capacity of 0 MiB is guaranteed to
+    hit the #27 terminal error -- whose message carries the exact figure the
+    server computed. Reading the number back out beats hardcoding it: a
+    hardcoded MiB constant goes quietly wrong the first time a test model or
+    the overhead percentage changes.
+
+    Leaves `model` unloaded and `total_file` starved; the caller sets the
+    capacity it actually wants to test with.
+    """
+    _write_total_vram_mb(total_file, 999_999)
+    _load_model_and_wait(model, timeout=120)
+    unload_res = server.make_request("POST", "/models/unload", data={"model": model})
+    assert unload_res.status_code == 200
+    _wait_for_model_status(model, {"unloaded"})
+
+    _write_total_vram_mb(total_file, 0)
+    res = server.make_request("POST", "/models/load", data={"model": model})
+    assert res.status_code == 503, \
+        f"expected the unfittable 503 to read {model}'s estimate off, got {res.status_code}: {res.body}"
+    match = re.search(r"needs an estimated (\d+) MiB", res.body["error"]["message"])
+    assert match, f"could not read an estimated footprint out of: {res.body}"
+    est_mib = int(match.group(1))
+    assert est_mib > 0, f"{model} estimated at 0 MiB -- not cached? (self.llamolotl#31)"
+    return est_mib
+
+
 def test_router_vram_aware_evicts_one_lru():
     """Free VRAM is too small for a second model -> loading it must evict
     the LRU resident model even though models_max (set high here) hasn't
@@ -195,17 +286,44 @@ def test_router_vram_aware_evicts_one_lru():
     doesn't catch it."""
     global server
     server.models_max = 4  # high enough that count-based eviction never triggers here
-    server.fake_free_vram_mb = 1  # smaller than any test model's estimated footprint
+    server.models_vram_margin_mb = 0
+    server.models_vram_overhead_pct = VRAM_TEST_OVERHEAD_PCT
+    total_file = os.path.join(TMP_DIR, "test_router_evicts_one_total_vram_mb.txt")
+    _write_total_vram_mb(total_file, 999_999)
+    server.fake_total_vram_mb_file = total_file
     server.start()
 
-    first, second = VRAM_CANDIDATE_MODELS[:2]
+    try:
+        first, second = VRAM_CANDIDATE_MODELS[:2]
+        est_first = _prime_and_measure(first, total_file)
+        est_second = _prime_and_measure(second, total_file)
 
-    _load_model_and_wait(first, timeout=120)
-    assert _get_model_status(first) == "loaded"
+        # `first` must be the larger of the two: after it is evicted the whole
+        # capacity is free, and `second` has to fit in it.
+        assert est_first >= est_second, \
+            f"this test needs {first} ({est_first} MiB) to be the larger model, not {second} ({est_second} MiB)"
+        # the aiming window is est_second wide; below ~4 MiB the 1 MiB
+        # truncation in the reported figures eats it
+        assert est_second >= 4, \
+            f"{second} estimates at only {est_second} MiB -- raise VRAM_TEST_OVERHEAD_PCT"
 
-    _load_model_and_wait(second, timeout=120)
-    assert _get_model_status(second) == "loaded"
-    assert _get_model_status(first) == "unloaded"
+        # Capacity that holds `first` alone with room to spare, but leaves less
+        # than `second` needs once `first` is resident:
+        #   load first  -> free = total          >= est_first          fits
+        #   load second -> free = total - first  == est_second // 2    does NOT fit
+        #   evict first -> free = total          >= est_second         fits
+        total = est_first + est_second // 2
+        _write_total_vram_mb(total_file, total)
+
+        _load_model_and_wait(first, timeout=120)
+        assert _get_model_status(first) == "loaded"
+
+        _load_model_and_wait(second, timeout=120)
+        assert _get_model_status(second) == "loaded"
+        assert _get_model_status(first) == "unloaded"
+    finally:
+        if os.path.exists(total_file):
+            os.remove(total_file)
 
 
 def test_router_vram_aware_evicts_multiple_lru():
@@ -213,34 +331,67 @@ def test_router_vram_aware_evicts_multiple_lru():
     evicting LRU models until it fits (or nothing is left to evict), not
     stop after the first one."""
     global server
-    server.models_max = 4  # high enough that count-based eviction doesn't interfere
-    fake_vram_file = os.path.join(TMP_DIR, "test_router_fake_free_vram_mb.txt")
-    with open(fake_vram_file, "w") as f:
-        f.write("999999")  # plenty of room while the first three load
-    server.fake_free_vram_mb_file = fake_vram_file
+    # count-based eviction must never interfere, whatever the candidate list holds
+    server.models_max = len(VRAM_CANDIDATE_MODELS) + 2
+    server.models_vram_margin_mb = 0
+    server.models_vram_overhead_pct = VRAM_TEST_OVERHEAD_PCT
+    total_file = os.path.join(TMP_DIR, "test_router_evicts_multiple_total_vram_mb.txt")
+    _write_total_vram_mb(total_file, 999_999)
+    server.fake_total_vram_mb_file = total_file
     server.start()
 
     try:
-        residents = VRAM_CANDIDATE_MODELS[:3]
+        # The BIG model is the incoming one here and the small ones are the
+        # residents -- the reverse of the single-eviction test above, and
+        # required rather than cosmetic. Freeing the last resident has to be
+        # what finally makes room, so the incoming model must outweigh the
+        # residents it displaces; with a small model incoming, the very first
+        # eviction would always be enough on its own and nothing would prove
+        # the loop iterates.
+        #
+        # Which model plays which role is decided from MEASURED footprints, not
+        # from position in the list: largest is the incoming one, and residents
+        # are taken smallest-first for as long as they still total less than it.
+        # Hardcoding the split would rot the moment a fixture model changes size.
+        est = {m: _prime_and_measure(m, total_file) for m in VRAM_CANDIDATE_MODELS}
+        incoming = max(est, key=lambda m: est[m])
+
+        residents: list[str] = []
+        for m in sorted((m for m in est if m != incoming), key=lambda m: est[m]):
+            if sum(est[r] for r in residents) + est[m] < est[incoming]:
+                residents.append(m)
+
+        assert len(residents) >= 2, (
+            f"need at least two residents that together weigh less than {incoming} "
+            f"({est[incoming]} MiB) to prove more than one eviction happens; got {est}"
+        )
+        est_mru = est[residents[-1]]  # largest resident -> loaded last -> evicted last
+        assert est_mru >= 4, \
+            f"{residents[-1]} estimates at only {est_mru} MiB -- raise VRAM_TEST_OVERHEAD_PCT"
+
+        # Capacity that fits the incoming model only once EVERY resident is
+        # gone. With residents r1..rN (ascending) and S = their total:
+        #   free after 0 evictions = total - S                  < est_incoming
+        #   free after k           = total - (r_k+1 + ... + rN) < est_incoming
+        #   free after N           = total                     >= est_incoming
+        # The last two lines pin `total` to a window one resident wide: at or
+        # above est_incoming, and strictly below est_incoming + rN.
+        total = est[incoming] + est_mru // 2
+        _write_total_vram_mb(total_file, total)
+
         for m in residents:
             _load_model_and_wait(m, timeout=120)
         for m in residents:
             assert _get_model_status(m) == "loaded"
 
-        # starve free VRAM -- the next load must evict all three residents to
-        # make room, one at a time, not just the single LRU
-        with open(fake_vram_file, "w") as f:
-            f.write("1")
+        _load_model_and_wait(incoming, timeout=120)
 
-        fourth = VRAM_CANDIDATE_MODELS[3]
-        _load_model_and_wait(fourth, timeout=120)
-
-        assert _get_model_status(fourth) == "loaded"
+        assert _get_model_status(incoming) == "loaded"
         for m in residents:
             assert _get_model_status(m) == "unloaded"
     finally:
-        if os.path.exists(fake_vram_file):
-            os.remove(fake_vram_file)
+        if os.path.exists(total_file):
+            os.remove(total_file)
 
 
 # ── VRAM-unfittable terminal load error (issue #27, R6 / AC3, AC4) ──────
@@ -358,6 +509,202 @@ def test_router_vram_aware_unfittable_autoload_chat_returns_503():
     finally:
         if os.path.exists(fake_vram_file):
             os.remove(fake_vram_file)
+
+
+# ── Declared footprints for unmeasurable configurations (#39) ──────────
+#
+# cold_start_estimate_bytes() disqualifies itself when a preset sets n-cpu-moe,
+# cpu-moe or override-tensor, because a GGUF's size stops being an upper bound
+# on what reaches the card once weights are deliberately kept in system RAM
+# (measured 6.0x over for GLM-4.5-Air-q8_0 at n-cpu-moe=40). Refusing to guess
+# is right, but it leaves those configurations with NO admission check until the
+# router has loaded them once and measured them -- and the child's own --fit
+# cannot cover the gap when n-cpu-moe and n-gpu-layers are both pinned, because
+# there is no layer budget left for it to reduce. In production that admitted a
+# 21.3 GiB model onto a card with 19.6 GiB free and it died on CUDA OOM.
+#
+# vram-footprint-mib is the seed for that window: a preset-only option (never
+# passed to the child) carrying a footprint somebody measured and wrote down.
+#
+# The first two tests below are a pair and should be read as one: the same
+# preset, the same starved card, differing only by the declaration.
+
+SPLIT_PRESET_MODEL = "model-ncmoe-declared"
+
+
+def _write_split_preset(path: str, declared_mib: int | None) -> None:
+    """A preset whose n-cpu-moe disqualifies the file-size estimate, optionally
+    carrying a declared footprint. stories15M_MOE is used because it is the one
+    cached test model with experts for -ncmoe to act on; the repo/file pair is
+    spelled exactly as ServerPreset.stories15m_moe() spells it, because the test
+    server runs --offline and only resolves what load_all() has already
+    cached."""
+    lines = [
+        f"[{SPLIT_PRESET_MODEL}]\n",
+        "hf-repo = ggml-org/stories15M_MOE\n",
+        "hf-file = stories15M_MOE-F16.gguf\n",
+        "n-cpu-moe = 1\n",
+    ]
+    if declared_mib is not None:
+        lines.append(f"vram-footprint-mib = {declared_mib}\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+
+def test_router_split_model_without_a_declaration_is_admitted_unchecked():
+    """Baseline for #39, and the reason it was filed: with n-cpu-moe set and no
+    declared footprint, the model is UNKNOWN -- so a starved card does not stop
+    it. This is the hole, asserted deliberately so that closing it elsewhere
+    cannot silently change this path too."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_split_undeclared.ini")
+    _write_split_preset(preset_path, declared_mib=None)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 1  # hopeless for anything with a known size
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded", \
+            "an unsized configuration must be admitted, not refused on a guess"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_declared_footprint_makes_a_split_model_checkable():
+    """The fix: the same preset plus vram-footprint-mib is sized, so the same
+    starved card refuses it with the structured 503 instead of admitting it into
+    an OOM. Nothing is resident, so there is nothing to evict first."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_split_declared.ini")
+    _write_split_preset(preset_path, declared_mib=4096)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 1
+    server.start()
+
+    try:
+        res = server.make_request("POST", "/models/load", data={"model": SPLIT_PRESET_MODEL})
+        assert res.status_code == 503, \
+            f"expected the unfittable 503 for a declared footprint, got {res.status_code}: {res.body}"
+        _assert_unfittable_503(res.body, SPLIT_PRESET_MODEL)
+        # refused before any child was spawned
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "unloaded"
+
+        # the declared figure is the one being reasoned about, not a file size
+        assert "4096 MiB" in res.body["error"]["message"], \
+            f"expected the declared 4096 MiB in the refusal, got: {res.body['error']['message']!r}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_declared_footprint_does_not_reach_the_child():
+    """vram-footprint-mib is preset-only. If it ever leaked into the child's
+    argv, llama-server would reject the unknown flag and every declared model
+    would fail to start -- so this asserts the load works, not just the plumbing."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_split_child_argv.ini")
+    _write_split_preset(preset_path, declared_mib=8)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 999_999  # abundant: the declaration must not refuse
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded"
+
+        res = server.make_request("GET", "/models")
+        assert res.status_code == 200
+        entry = next(m for m in res.body["data"] if m["id"] == SPLIT_PRESET_MODEL)
+        args = entry.get("status", {}).get("args", [])
+        assert not any("vram-footprint" in str(a) for a in args), \
+            f"preset-only option leaked into the child argv: {args!r}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_measurement_outranks_a_stale_declaration():
+    """A declaration is only a seed. Once the router has measured the
+    configuration itself, a wrong declaration must not be able to refuse a load
+    that fits.
+
+    This also pins the decision to strip vram-footprint-mib out of
+    footprint_key(): the declaration is a claim ABOUT a configuration, not part
+    of it, so adding one must not invalidate a measurement already taken for the
+    same configuration. If the key included it, the reload below would look like
+    a brand-new configuration and the stale declaration would win -- which is
+    exactly the 503 this test asserts against.
+
+    fake_measured_mib is required, not a convenience: CI runs against a stub
+    CUDA driver, children report "memory": [], and every real measurement is
+    therefore 0. Without it there is nothing for a measurement to outrank and
+    the test cannot pass on any GPU-less runner."""
+    global server
+    server.models_max = 4
+    server.fake_measured_mib = 64  # what the child would have reported on a card
+    preset_path = os.path.join(TMP_DIR, "test_router_split_measured_wins.ini")
+    _write_split_preset(preset_path, declared_mib=None)
+    server.models_preset = preset_path
+    # the file hook, not the static one: free VRAM has to change mid-test, and
+    # the static value is read from the environment once at spawn
+    fake_vram_file = os.path.join(TMP_DIR, "test_router_split_measured_wins_vram_mb.txt")
+    with open(fake_vram_file, "w") as f:
+        f.write("999999")
+    server.fake_free_vram_mb_file = fake_vram_file
+    server.start()
+
+    try:
+        # load once so the child reports its real footprint (a few MiB), then
+        # unload so nothing is resident to evict later
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        unload_res = server.make_request("POST", "/models/unload", data={"model": SPLIT_PRESET_MODEL})
+        assert unload_res.status_code == 200
+        _wait_for_model_status(SPLIT_PRESET_MODEL, {"unloaded"})
+
+        # now declare an absurd figure and re-read the preset
+        _write_split_preset(preset_path, declared_mib=999_999)
+        assert SPLIT_PRESET_MODEL in _get_model_ids(is_reload=True)
+
+        # 8 GiB free: far more than the measured footprint, far less than the
+        # declaration. Admitting it proves the measurement won.
+        with open(fake_vram_file, "w") as f:
+            f.write("8192")
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded", \
+            "a measured footprint must outrank a declared one"
+    finally:
+        os.remove(preset_path)
+        if os.path.exists(fake_vram_file):
+            os.remove(fake_vram_file)
+
+
+@pytest.mark.parametrize("declared", ["0", "-1", "not-a-number"])
+def test_router_unusable_declaration_is_treated_as_absent(declared):
+    """A zero, negative or unparseable declaration is no claim at all -- it must
+    fall through to unknown and admit the load, never be read as a footprint of
+    zero (which would make every model look free) and never abort the router."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_split_bad_decl.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            f"[{SPLIT_PRESET_MODEL}]\n"
+            "hf-repo = ggml-org/stories15M_MOE\n"
+            "hf-file = stories15M_MOE-F16.gguf\n"
+            "n-cpu-moe = 1\n"
+            f"vram-footprint-mib = {declared}\n"
+        )
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 1
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded"
+    finally:
+        os.remove(preset_path)
 
 
 def test_router_vram_aware_disabled_does_not_evict():
@@ -666,14 +1013,29 @@ def _router_stream_chat_and_collect(server: ServerProcess, model: str, content: 
     via explicit cancel, or via error). Any exception lands in
     `results["error"]` instead of being raised, since this runs off the main
     test thread.
+
+    Also stamps `results["ended_at"]` (time.monotonic()) at termination.
+    `ended` on its own can't tell "cancelled" apart from "finished by
+    itself", so the cancel-isolation test compares that stamp against when
+    the cancel was sent rather than racing it -- see
+    test_router_explicit_cancel_targets_correct_worker.
     """
     url = f"http://{server.server_host}:{server.server_port}/v1/chat/completions"
     try:
+        # ignore_eos stops the model halting on an EOS token, but it does NOT
+        # make a stream long-lived: the stories260K fixtures run with
+        # n_ctx=1024 shared across the router's children, and a stream still
+        # terminates on context exhaustion ("truncated = 1" in the server log)
+        # after ~128 tokens regardless of max_tokens. So neither this flag nor
+        # any max_tokens value can guarantee a concurrent stream is still alive
+        # at an arbitrary later moment -- which is why the isolation check is a
+        # timestamp comparison, not a liveness race.
         resp = requests.post(url, json={
             "model": model,
             "max_tokens": 512,
             "messages": [{"role": "user", "content": content}],
             "stream": True,
+            "ignore_eos": True,
         }, stream=True)
         try:
             if resp.status_code != 200:
@@ -698,6 +1060,7 @@ def _router_stream_chat_and_collect(server: ServerProcess, model: str, content: 
     except Exception as e:
         results["error"] = str(e)
     finally:
+        results["ended_at"] = time.monotonic()
         results["ended"] = True
 
 
@@ -747,6 +1110,7 @@ def test_router_explicit_cancel_targets_correct_worker():
     assert results_a["id"] != results_b["id"]
 
     # cancel only model A's completion, explicitly, while both are still generating
+    cancel_sent_at = time.monotonic()
     cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
         "id": results_a["id"],
         "action": "cancel",
@@ -762,10 +1126,26 @@ def test_router_explicit_cancel_targets_correct_worker():
     # ended well short of the full 512 max_tokens requested
     assert results_a.get("n_chunks", 0) < 512
 
-    # model B's generation must be unaffected by A's cancel: it should still
-    # be running (not already marked "ended") right after A's cancel landed
-    assert results_b.get("ended", False) is False, \
-        "model B's stream must not have been cancelled by model A's cancel call"
+    # model B's generation must be unaffected by A's cancel. The check is
+    # "B did not end BECAUSE of the cancel", not "B is still running": B is a
+    # tiny fixture model on a small shared context, so it legitimately
+    # finishes on its own (context exhaustion, "truncated = 1") in well under
+    # a second -- often before the cancel is even sent. Asserting liveness
+    # here made the test fail whenever B simply won that race, which says
+    # nothing about isolation.
+    #
+    # So: if B already ended before the cancel went out, it provably wasn't
+    # the cancel that ended it. Otherwise B must survive a short window past
+    # the cancel -- if A's cancel bled across to B's child worker, B would
+    # terminate within milliseconds of it, the same way A does.
+    b_ended_at = results_b.get("ended_at")
+    if b_ended_at is None or b_ended_at > cancel_sent_at:
+        assert not _wait_until(
+            lambda: results_b.get("ended", False), timeout=1.0
+        ), (
+            "model B's stream ended right after model A's cancel call -- "
+            f"cancel bled across child workers (b={results_b})"
+        )
 
     # cleanup: cancel B too so this test doesn't leave a background
     # generation running past teardown

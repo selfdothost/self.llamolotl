@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <string>
 #include <vector>
 
 enum common_params_fit_status {
@@ -33,6 +34,29 @@ void common_fit_print(
                llama_context_params * cparams);
 
 void common_memory_breakdown_print(const llama_context * ctx);
+
+// Per-device memory ACTUALLY ALLOCATED by an already-loaded context, in bytes.
+//
+// This is the measured sibling of common_get_device_memory_data(): that one
+// projects what a model WOULD need by loading it with no_alloc, this one asks a
+// live context what it DID take. Same numbers, same attribution logic, opposite
+// side of the load.
+//
+// Note this reports what llama.cpp allocated, NOT what the driver reports for
+// the process -- the CUDA primary context and any allocator slack are outside
+// llama.cpp's accounting and so are outside this. That is the useful split for
+// a caller deciding what it can free by unloading THIS model.
+struct common_ctx_device_memory {
+    std::string name;        // backend device name, e.g. "CUDA0"
+    std::string description; // e.g. "NVIDIA GeForce RTX 4090"
+    int64_t total   = 0;     // device capacity
+    int64_t free    = 0;     // device free memory at the time of the call
+    size_t  model   = 0;     // weights placed on this device
+    size_t  context = 0;     // KV cache and other context allocations
+    size_t  compute = 0;     // temporary compute buffers
+};
+
+std::vector<common_ctx_device_memory> common_get_context_device_memory(const llama_context * ctx);
 
 struct common_device_memory_data {
     int64_t total;

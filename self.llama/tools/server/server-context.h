@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fit.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -51,6 +52,15 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // What this model ACTUALLY took on each device, measured after load rather
+    // than estimated before it (self.llamolotl#36). The router sizes eviction
+    // and admission from a GGUF file size today, which is blind to -ncmoe and
+    // -ngl -- the two options whose whole purpose is keeping weights OFF the
+    // card -- and so refuses models that fit with room to spare. A number the
+    // loaded process reports about itself cannot be blind to its own placement.
+    // Empty when no device backend is present (CPU-only builds).
+    std::vector<common_ctx_device_memory> device_memory;
 };
 
 enum server_state {

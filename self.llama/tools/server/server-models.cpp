@@ -778,18 +778,47 @@ std::vector<server_model_meta> server_models::get_all_meta() {
 // Best-effort query of total free VRAM across all visible GPUs, in bytes.
 // Returns std::nullopt -- "unknown", never "zero" -- if nvidia-smi isn't on
 // PATH, exits non-zero, times out, or its output doesn't parse.
-static std::optional<int64_t> query_free_vram_bytes() {
-    // Test-only overrides, checked before the real nvidia-smi query. Neither
-    // is a documented public flag -- real deployments never set them. They
-    // exist so tools/server/tests/unit/test_router.py can deterministically
+//
+// `resident_est_bytes` is the summed estimated footprint of the models
+// currently resident on the GPU. The real query ignores it entirely -- the
+// driver already accounts for them. It exists only for the fake-total test
+// hook below, and callers outside a test build may pass 0.
+static std::optional<int64_t> query_free_vram_bytes(int64_t resident_est_bytes) {
+    // Test-only overrides, checked before the real nvidia-smi query. None of
+    // these is a documented public flag -- real deployments never set them.
+    // They exist so tools/server/tests/unit/test_router.py can deterministically
     // exercise VRAM-aware eviction (including forcing multi-model eviction
     // in one load) without real GPU memory pressure, since CI may run these
     // router tests on GPU-less hosts with no nvidia-smi at all.
+    //   - LLAMA_TEST_FAKE_TOTAL_VRAM_MB_FILE: path to a text file containing a
+    //     fake *total* VRAM capacity in MiB, re-read on every call. Free VRAM
+    //     is derived as total - resident_est_bytes, so evicting a model
+    //     actually RAISES the next reading, the way a real driver behaves.
+    //     The two fixed-value hooks below cannot express that -- they return
+    //     whatever the test last wrote, so an eviction never makes room and
+    //     evict_for_vram()'s loop can only ever run itself out of candidates
+    //     and throw. That is self.llamolotl#34, and this is its fix: eviction
+    //     tests need the reading to respond to eviction.
     //   - LLAMA_TEST_FAKE_FREE_VRAM_MB_FILE: path to a text file containing
     //     the fake free-VRAM value in MiB, re-read on every call -- lets a
     //     single already-running test server have "free VRAM" change
     //     mid-test (the real value naturally does too, as models load).
     //   - LLAMA_TEST_FAKE_FREE_VRAM_MB: a static fake value in MiB.
+    // Checked most-specific first; a test sets one of them, never several.
+    if (const char * fake_total_file = std::getenv("LLAMA_TEST_FAKE_TOTAL_VRAM_MB_FILE")) {
+        std::ifstream f(fake_total_file);
+        std::string line;
+        if (f && std::getline(f, line)) {
+            try {
+                const int64_t total_bytes = (int64_t) std::stoll(line) * 1024 * 1024;
+                // clamp at 0: over-subscribed is "nothing free", not negative free
+                return std::max<int64_t>(0, total_bytes - resident_est_bytes);
+            } catch (const std::exception &) {
+                return std::nullopt; // malformed override -- "unknown", not a real query
+            }
+        }
+        return std::nullopt; // configured but unreadable right now -- same treatment
+    }
     if (const char * fake_file = std::getenv("LLAMA_TEST_FAKE_FREE_VRAM_MB_FILE")) {
         std::ifstream f(fake_file);
         std::string line;
@@ -892,11 +921,46 @@ static std::optional<int64_t> query_free_vram_bytes() {
 // GGUF file(s) on disk (primary weights + any split shards + mmproj, if
 // configured), inflated by `overhead_pct` to approximate KV-cache /
 // compute-buffer usage not captured by file size alone. Returns 0 if no
-// local file could be resolved (e.g. a remote HF-repo preset that hasn't
-// been downloaded/cached yet) -- callers must treat 0 as "unknown", not "no
-// footprint".
-static int64_t estimate_model_footprint_bytes(const server_model_meta & meta, int overhead_pct) {
+// local file could be resolved (e.g. an HF-repo preset whose weights are not
+// in the cache yet) -- callers must treat 0 as "unknown", not "no footprint".
+//
+// A direct LLAMA_ARG_MODEL only exists for presets that name a local path.
+// Router-mode models are normally loaded by HF repo (LLAMA_ARG_HF_REPO), which
+// has no path to stat -- so before giving up we resolve the preset the same way
+// update_caps() does, with offline=true, which fills in the local cache path
+// without downloading anything. Skipping that step is what made
+// models_vram_aware silently degrade to count-only eviction for every
+// HF-repo-loaded model (#31).
+static int64_t cold_start_estimate_bytes(const server_model_meta & meta, int overhead_pct) {
     namespace fs = std::filesystem;
+
+    // GATE (self.llamolotl#36): this heuristic is only allowed where it is an
+    // UPPER BOUND on what lands on the card. File size counts every weight in
+    // the GGUF, so it is a fair proxy only when nothing is deliberately kept in
+    // system RAM. Measured on the live 4090: for fully-offloaded models it sits
+    // within 2-11% (Qwen2.5-Coder-32B 22.2 GiB estimated / 22.26 measured,
+    // gemma-4 15.9 / 14.48, Qwen2.5-VL 6.7 / 7.48) -- but with expert offload it
+    // is 1.8x over for Qwen3-Coder-Next (n-cpu-moe=25) and 6.0x for
+    // GLM-4.5-Air-q8_0 (n-cpu-moe=40, 131.3 GiB estimated against 21.33 GiB
+    // actually resident), which is what made the router refuse both on a card
+    // they fit in with room to spare.
+    //
+    // So: any option that moves weights off the GPU disqualifies the estimate
+    // entirely. Return 0 -- unknown -- and let the load proceed under the
+    // child's own --fit, exactly as an unmeasured configuration does.
+    //
+    // A partial -ngl is NOT disqualifying: it only makes this an over-estimate,
+    // and over-estimating is the safe direction here (we may evict more than
+    // needed, or refuse something that would have fit; we never OOM). Erring
+    // that way is what the old estimator did for every model -- the bug was
+    // doing it where the error reached 6x, not the direction itself.
+    for (const char * off_gpu : {"LLAMA_ARG_N_CPU_MOE", "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_OVERRIDE_TENSOR"}) {
+        std::string unused;
+        if (meta.preset.get_option(off_gpu, unused)) {
+            return 0;
+        }
+    }
+
 
     auto file_size_with_shards = [](const std::string & path) -> int64_t {
         if (path.empty()) {
@@ -954,10 +1018,193 @@ static int64_t estimate_model_footprint_bytes(const server_model_meta & meta, in
     }
 
     if (total <= 0) {
-        return 0; // unresolved local path (e.g. remote-only preset) -- unknown, not zero footprint
+        // No local path in the preset. Resolve HF-repo (and *_URL) presets to
+        // their cache location. offline=true means this only ever *looks up*
+        // where the weights would be -- it never downloads, so a model that has
+        // not been fetched yet still correctly reports 0 ("unknown").
+        try {
+            common_params params;
+            meta.preset.apply_to_params(params, {
+                "LLAMA_ARG_MODEL",
+                "LLAMA_ARG_MODEL_URL",
+                "LLAMA_ARG_MMPROJ",
+                "LLAMA_ARG_MMPROJ_URL",
+                "LLAMA_ARG_MMPROJ_AUTO",
+                "LLAMA_ARG_HF_REPO",
+                "LLAMA_ARG_HF_REPO_FILE",
+            });
+            params.offline = true;
+
+            common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
+            common_models_handler_apply(handler, params);
+
+            total += file_size_with_shards(params.model.path);
+            if (!params.no_mmproj) {
+                total += file_size_with_shards(params.mmproj.path);
+            }
+        } catch (const std::exception & e) {
+            // Same posture as update_caps(): a preset we cannot resolve is not
+            // fatal here. Returning 0 below keeps the safe "unknown, don't
+            // guess" path that evict_for_vram() already handles.
+            LOG_WRN("failed to resolve model path for VRAM footprint estimate (model=%s): %s\n",
+                    meta.name.c_str(), e.what());
+        }
+    }
+
+    if (total <= 0) {
+        return 0; // unresolved local path (e.g. not downloaded yet) -- unknown, not zero footprint
     }
 
     return total + (total * (int64_t) std::max(0, overhead_pct)) / 100;
+}
+
+// An operator-declared footprint for this configuration, in bytes, or 0 if the
+// preset does not carry one (issue #39).
+//
+// This is NOT a relaxation of "never guess a footprint". A declared value is a
+// measurement -- it is what somebody read off this card for this configuration
+// and then wrote down -- whereas cold_start_estimate_bytes() derives a number
+// from a file size, which is why that one has to disqualify itself the moment
+// weights are deliberately kept in system RAM. The distinction that matters is
+// where the number came from, not whether it is a literal.
+//
+// It exists because that disqualification leaves split (-ncmoe / -ot)
+// configurations with no admission check at all until the router has loaded
+// them once. Observed in production: GLM-4.5-Air-q8_0 (n-cpu-moe=40, 21.3 GiB
+// measured) was admitted onto a card with 19.6 GiB free because another tenant
+// held 4.4 GiB, and died on CUDA OOM. The child's own --fit is no help there --
+// n-cpu-moe and n-gpu-layers are both pinned in the preset, so fitting has no
+// layer budget left to reduce.
+//
+// Declaring a value is the operator saying "I measured this, use it until you
+// have measured it yourself". A real measurement always outranks it.
+static int64_t declared_footprint_bytes(const server_model_meta & meta) {
+    std::string value;
+    if (!meta.preset.get_option(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB, value)) {
+        return 0;
+    }
+    try {
+        const int64_t mib = std::stoll(value);
+        if (mib <= 0) {
+            return 0; // 0 or negative means "no claim", same as absent
+        }
+        return mib * 1024 * 1024;
+    } catch (const std::exception &) {
+        LOG_WRN("ignoring unparseable vram-footprint-mib for model=%s: '%s'\n", meta.name.c_str(), value.c_str());
+        return 0;
+    }
+}
+
+// Identity of a model CONFIGURATION for footprint purposes (issue #36).
+//
+// The effective preset with the per-instance injections update_args() adds
+// (HOST/PORT/ALIAS) stripped back out, rendered to INI. Two launches of the same
+// configuration produce the same key; changing n-cpu-moe, n-gpu-layers,
+// ctx-size or a cache type produces a different one, which is the entire point
+// -- those are exactly the options that move the footprint.
+//
+// vram-footprint-mib is stripped for the opposite reason: it is a claim ABOUT
+// the configuration, not part of it. Leaving it in would mean declaring a value
+// invalidates every measurement already taken for that same configuration.
+std::string server_models::footprint_key(const server_model_meta & meta) {
+    common_preset p = meta.preset;
+    p.unset_option("LLAMA_ARG_HOST");
+    p.unset_option("LLAMA_ARG_PORT");
+    p.unset_option("LLAMA_ARG_ALIAS");
+    p.unset_option(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB);
+    return p.to_ini();
+}
+
+// Record what a child measured about itself, from the ready payload it sends
+// (see get_model_info(), tools/server/server-context.cpp). The child reports a
+// per-device breakdown; what matters here is how much of the CARD a load of
+// this configuration costs, so device entries are summed and host memory is
+// excluded by the child already -- weights that -ncmoe pushed to system RAM are
+// precisely what must not count against the card.
+//
+// Caller must hold mutex.
+void server_models::record_measured_footprint(const server_model_meta & meta) {
+    if (!meta.loaded_info.is_object()) {
+        return;
+    }
+    auto it_mem = meta.loaded_info.find("memory");
+    if (it_mem == meta.loaded_info.end() || !it_mem->is_array()) {
+        return; // older child build, or a wake-from-sleep with no payload
+    }
+
+    int64_t total = 0;
+    for (const auto & dev : *it_mem) {
+        if (!dev.is_object()) {
+            continue;
+        }
+        total += (int64_t) json_value(dev, "model",   (uint64_t) 0);
+        total += (int64_t) json_value(dev, "context", (uint64_t) 0);
+        total += (int64_t) json_value(dev, "compute", (uint64_t) 0);
+    }
+    if (total <= 0) {
+        // Test-only override, in the same family as the LLAMA_TEST_FAKE_*_VRAM_MB
+        // hooks in query_free_vram_bytes() and never set in a real deployment.
+        //
+        // CI runs these tests against a stub CUDA driver, so a child reports
+        // "memory": [] -- there are no devices to attribute anything to. Every
+        // measurement is therefore 0 there, which makes any test of "a
+        // measurement outranks X" unsatisfiable rather than merely red. This
+        // supplies the figure the child would have reported on a real card.
+        //
+        // Deliberately placed AFTER the payload sum, not before it: a genuine
+        // measurement always wins, so the hook cannot mask a real reading.
+        if (const char * fake_mib = std::getenv("LLAMA_TEST_FAKE_MEASURED_MIB")) {
+            try {
+                total = (int64_t) std::stoll(fake_mib) * 1024 * 1024;
+            } catch (const std::exception &) {
+                return;
+            }
+        }
+    }
+    if (total <= 0) {
+        return; // a CPU-only load holds no card; nothing to remember
+    }
+
+    const std::string key = footprint_key(meta);
+    measured_footprints[key] = total;
+    SRV_INF("measured footprint for name=%s: %lld MiB\n", meta.name.c_str(), (long long) (total / (1024 * 1024)));
+}
+
+// Caller must hold mutex.
+std::optional<int64_t> server_models::lookup_measured_footprint(const server_model_meta & meta) {
+    auto it = measured_footprints.find(footprint_key(meta));
+    if (it == measured_footprints.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+// The one place that decides how big a configuration is, in bytes, or 0 for
+// "unknown". Every caller in evict_for_vram() goes through here so the incoming
+// model and the resident models can never be sized by different rules -- sizing
+// an arrival generously and the residents meanly is how an admission check
+// starts refusing loads that fit.
+//
+// Precedence, most trustworthy first:
+//   1. measured  -- what a child of ours reported after loading this exact
+//                   configuration in this process
+//   2. declared  -- vram-footprint-mib in the preset: a measurement somebody
+//                   took and wrote down (#39)
+//   3. estimated -- cold_start_estimate_bytes(): GGUF size + overhead, and only
+//                   where that is an upper bound (it disqualifies itself for
+//                   -ncmoe / -ot, which is what makes (2) necessary at all)
+//   4. unknown   -- 0. Not a size. evict_for_vram() steps aside and the load
+//                   proceeds under models_max and the child's own --fit.
+//
+// Caller must hold mutex.
+int64_t server_models::footprint_bytes(const server_model_meta & meta) {
+    if (auto measured = lookup_measured_footprint(meta)) {
+        return *measured;
+    }
+    if (const int64_t declared = declared_footprint_bytes(meta); declared > 0) {
+        return declared;
+    }
+    return cold_start_estimate_bytes(meta, base_params.models_vram_overhead_pct);
 }
 
 void server_models::evict_for_vram(const server_model_meta & incoming) {
@@ -965,16 +1212,51 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
         return;
     }
 
-    int64_t incoming_bytes = estimate_model_footprint_bytes(incoming, base_params.models_vram_overhead_pct);
+    // How big this configuration is: measured, else declared, else estimated,
+    // else unknown. See footprint_bytes() for why the order is that order.
+    //
+    // Unknown is 0, and 0 means we step aside: fall back to the models_max count
+    // limit and let the load proceed under the child's own parameter fitting
+    // (--fit, on by default with a per-device target margin). Refusing on a
+    // number we do not have is how issue #36 got filed -- sizing a model by its
+    // GGUF file x an overhead percentage put GLM-4.5-Air-q8_0 at 131 GiB when it
+    // occupies 21, and refused it on a card it fits in with room to spare.
+    //
+    // Stepping aside is not free either, and #39 is the other edge of it: --fit
+    // cannot rescue a configuration that pins both n-cpu-moe and n-gpu-layers,
+    // because there is no layer budget left for it to reduce. That is what
+    // vram-footprint-mib is for.
+    int64_t incoming_bytes = 0;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        incoming_bytes = footprint_bytes(incoming);
+    }
     if (incoming_bytes <= 0) {
-        // can't estimate this model's footprint -- don't guess, fall back to models_max only
         return;
     }
+    // The margin now carries a second job worth naming: a measured footprint is
+    // llama.cpp's own accounting, which excludes the CUDA primary context the
+    // incoming child will create (a few hundred MiB the driver reports but
+    // llama.cpp never allocates). The default 512 MiB margin covers it.
     const int64_t margin_bytes = (int64_t) base_params.models_vram_margin_mb * 1024 * 1024;
 
     // bounded: each iteration evicts exactly one resident model, so this always terminates
     for (;;) {
-        auto free_bytes = query_free_vram_bytes();
+        // resident_est_bytes is ignored by the real nvidia-smi path (the driver
+        // already accounts for resident models); it exists so the fake-total
+        // test hook can derive free VRAM as total - resident, which is what
+        // makes an eviction actually raise the next reading (#34).
+        int64_t resident_bytes = 0;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            for (const auto & [key, inst] : mapping) {
+                if (inst.meta.status != SERVER_MODEL_STATUS_LOADED) {
+                    continue;
+                }
+                resident_bytes += footprint_bytes(inst.meta);
+            }
+        }
+        auto free_bytes = query_free_vram_bytes(resident_bytes);
         if (!free_bytes.has_value()) {
             // unknown free VRAM (no nvidia-smi / non-NVIDIA backend) -- never treat that as
             // "zero free", which would evict everything; just fall back to models_max only
@@ -1341,6 +1623,11 @@ void server_models::update_status(const std::string & name, const update_status_
         meta.exit_code   = args.exit_code;
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
+            if (args.status == SERVER_MODEL_STATUS_LOADED) {
+                // A ready child has just told us what it actually cost. This is
+                // the only moment that measurement exists (issue #36).
+                record_measured_footprint(meta);
+            }
         }
         if (!args.progress.is_null()) {
             meta.progress = args.progress;
