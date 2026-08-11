@@ -119,6 +119,15 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    // YARD ADDITION (self.ai#128): exempt from LRU eviction, set from the preset's
+    // `pin` option. A pinned model still COUNTS toward models_max -- it reserves a
+    // slot rather than creating one -- it is only never chosen as the victim.
+    //
+    // Deliberately LAST. This struct is aggregate-initialised positionally with
+    // /* field */ comments in server-models.cpp; a member inserted mid-struct
+    // silently re-binds every initialiser after it. Appending leaves those sites
+    // untouched and lets the NSDMI below supply the default.
+    bool pinned = false;
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     bool is_ready() const {
@@ -139,6 +148,21 @@ struct server_model_meta {
 
 struct server_models_routes;
 struct server_subproc; // defined in server-models.cpp
+
+// How big a model configuration is, and how we know (self.ai#107).
+//
+// `source` is as load-bearing as `bytes` for anything downstream: a "measured"
+// figure is what a child of ours actually reported, while "estimated" is a file
+// size plus an overhead percentage and "declared" is an operator's claim. A
+// consumer deciding whether to reclaim another tenant's VRAM on the strength of
+// this number deserves to know which one it got.
+//
+// bytes == 0 means UNKNOWN -- not "this model is free". Callers must treat it as
+// absence of information; `source` is nullptr in that case.
+struct footprint_info {
+    int64_t      bytes  = 0;
+    const char * source = nullptr; // "measured" | "declared" | "estimated" | nullptr
+};
 
 struct server_models {
     friend struct server_models_routes;
@@ -238,7 +262,7 @@ private:
     // declared via vram-footprint-mib (#39), else the file-size estimate, else
     // unknown. The single sizing rule for evict_for_vram(), so an incoming model
     // and the resident ones are never sized differently. Caller must hold mutex.
-    int64_t footprint_bytes(const server_model_meta & meta);
+    footprint_info footprint_bytes(const server_model_meta & meta);
 
     common_preset_context ctx_preset;
 
@@ -263,6 +287,15 @@ private:
     // letting the load proceed into an OOM; ex_wrapper maps it to a structured HTTP 503 (T-006).
     void evict_for_vram(const server_model_meta & incoming);
 
+    // Issue #29: rewrite an unfittable model's config to push more expert layers
+    // to system RAM, so it loads degraded instead of being refused. True when the
+    // config was rewritten and the load should proceed; false when no shed can be
+    // sized and the caller should refuse as before. Only called once nothing else
+    // is evictable, so it competes with a refusal rather than a cheaper option.
+    bool try_shed_to_fit(const server_model_meta & incoming,
+                         int64_t needed_bytes,
+                         int64_t budget_bytes);
+
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
@@ -270,6 +303,16 @@ private:
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
 public:
+    // Public, lock-taking wrapper over footprint_bytes() for reporting (#107).
+    //
+    // GET /v1/models runs outside the mutex over copies from get_all_meta(),
+    // but the measured-footprint map is shared state, so the lookup has to take
+    // the lock itself. Exists so self.ai can size a VRAM lease request for a
+    // model it is about to ask us to load: without a published figure, core has
+    // no way to ask the broker for the right amount and its only options are to
+    // guess or to skip the broker entirely -- which is self.ai#107.
+    footprint_info footprint_report(const server_model_meta & meta);
+
     // conv_id -> model tracker for the resumable stream routes, owns its lock
     conv_model_tracker conv_models;
 

@@ -4439,9 +4439,30 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB).set_preset_only());
 
-    // args.push_back(common_arg(
-    //     {"pin"},
-    //     "in server router mode, do not unload this model if models_max is exceeded",
-    //     [](common_params &) { /* unused */ }
-    // ).set_preset_only());
+    // Same STRING-handler reasoning as vram-footprint-mib above: apply_to_params()
+    // runs every option's handler including preset-only ones, and handler_int would
+    // put a hand-typed value through std::stoi() and throw out of preset loading.
+    args.push_back(common_arg(
+        {"vram-shed-mib-per-layer"}, "MIB",
+        "in server router mode, how much VRAM one expert layer of this model frees when moved "
+        "to system RAM. Lets the router respawn a model that does not fit with a higher "
+        "--n-cpu-moe instead of refusing the load outright -- slower, but serving. Omit it and "
+        "an unfittable model is refused exactly as before",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER).set_preset_only());
+
+    // Upstream sketched this one and left it commented out; the yard needs it, so
+    // it is implemented here (self.ai#128). A STRING handler and a truthiness test
+    // rather than a bare flag, matching load-on-startup: preset options arrive as
+    // `key = value` from the ini, so there is no valueless form to parse, and the
+    // same apply_to_params() hazard applies -- handler_bool on a hand-typed value
+    // would throw out of preset loading rather than being ignored.
+    args.push_back(common_arg(
+        {"pin"}, "BOOL",
+        "in server router mode, never choose this model as the LRU eviction victim when "
+        "models_max is reached. For always-on support models -- an embedder, a reranker -- "
+        "that a chat-model swap would otherwise silently unload. Pinned models still COUNT "
+        "toward models_max: pinning reserves a slot, it does not create one",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_PIN).set_preset_only());
 }

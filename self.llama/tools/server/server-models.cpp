@@ -426,6 +426,14 @@ void server_models::load_models() {
                     inst.meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
                 }
             }
+            // YARD ADDITION (self.ai#128): pin exemption from LRU eviction.
+            // Assigned unconditionally, never only-when-present: this lambda also
+            // runs on RELOAD, so a `pin` deleted from the preset has to clear the
+            // flag. A present-only assignment would leave a model pinned forever
+            // with nothing in the preset to explain why.
+            std::string pin_val;
+            inst.meta.pinned = inst.meta.preset.get_option(COMMON_ARG_PRESET_PIN, pin_val)
+                && common_arg_utils::is_truthy(pin_val);
         }
     };
     // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
@@ -1095,6 +1103,45 @@ static int64_t declared_footprint_bytes(const server_model_meta & meta) {
     }
 }
 
+// How much VRAM one expert layer frees when moved to system RAM (issue #29).
+//
+// Zero means "no claim", and a model with no claim is refused when it does not
+// fit, exactly as before. This is deliberately operator-declared rather than
+// derived: the cost varies enormously by model (~1298 MiB/layer measured on
+// GLM-4.5-Air against ~664 MiB/layer on Qwen3-Coder-Next) and the router has no
+// architecture metadata to compute it from. Both figures were already measured
+// and written down in the deployment's preset comments; this only makes them
+// machine-readable.
+static int64_t shed_mib_per_layer(const server_model_meta & meta) {
+    std::string value;
+    if (!meta.preset.get_option(COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER, value)) {
+        return 0;
+    }
+    try {
+        const int64_t mib = std::stoll(value);
+        return mib > 0 ? mib : 0;
+    } catch (const std::exception &) {
+        LOG_WRN("ignoring unparseable vram-shed-mib-per-layer for model=%s: '%s'\n",
+                meta.name.c_str(), value.c_str());
+        return 0;
+    }
+}
+
+// The model's current expert-offload setting. Absent means 0 -- nothing on the
+// CPU yet, which is a legitimate starting point to shed from.
+static int current_n_cpu_moe(const server_model_meta & meta) {
+    std::string value;
+    if (!meta.preset.get_option("LLAMA_ARG_N_CPU_MOE", value)) {
+        return 0;
+    }
+    try {
+        const int n = std::stoi(value);
+        return n > 0 ? n : 0;
+    } catch (const std::exception &) {
+        return 0;
+    }
+}
+
 // Identity of a model CONFIGURATION for footprint purposes (issue #36).
 //
 // The effective preset with the per-instance injections update_args() adds
@@ -1112,6 +1159,16 @@ std::string server_models::footprint_key(const server_model_meta & meta) {
     p.unset_option("LLAMA_ARG_PORT");
     p.unset_option("LLAMA_ARG_ALIAS");
     p.unset_option(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB);
+    // Also a claim ABOUT a configuration rather than part of one (issue #29):
+    // two otherwise-identical presets that disagree only on the per-layer shed
+    // cost describe the same child process and must share its measurement.
+    p.unset_option(COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER);
+    // And pin (self.ai#128), for a third time the same reason: it is router
+    // eviction POLICY, not part of the child's configuration. Two presets that
+    // differ only in pin launch byte-identical children and must share the
+    // measurement -- otherwise pinning a model throws away every footprint
+    // already measured for it, which is the opposite of what pinning is for.
+    p.unset_option(COMMON_ARG_PRESET_PIN);
     return p.to_ini();
 }
 
@@ -1197,14 +1254,26 @@ std::optional<int64_t> server_models::lookup_measured_footprint(const server_mod
 //                   proceeds under models_max and the child's own --fit.
 //
 // Caller must hold mutex.
-int64_t server_models::footprint_bytes(const server_model_meta & meta) {
+footprint_info server_models::footprint_bytes(const server_model_meta & meta) {
     if (auto measured = lookup_measured_footprint(meta)) {
-        return *measured;
+        return {*measured, "measured"};
     }
     if (const int64_t declared = declared_footprint_bytes(meta); declared > 0) {
-        return declared;
+        return {declared, "declared"};
     }
-    return cold_start_estimate_bytes(meta, base_params.models_vram_overhead_pct);
+    const int64_t estimated = cold_start_estimate_bytes(meta, base_params.models_vram_overhead_pct);
+    if (estimated > 0) {
+        return {estimated, "estimated"};
+    }
+    return {}; // unknown: bytes 0, source nullptr -- absence of information, not "free"
+}
+
+// Public, lock-taking wrapper for reporting (self.ai#107). GET /v1/models runs
+// outside the mutex over copies from get_all_meta(), but measured_footprints is
+// shared state, so the lookup must take the lock itself.
+footprint_info server_models::footprint_report(const server_model_meta & meta) {
+    std::unique_lock<std::mutex> lk(mutex);
+    return footprint_bytes(meta);
 }
 
 void server_models::evict_for_vram(const server_model_meta & incoming) {
@@ -1229,7 +1298,7 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
     int64_t incoming_bytes = 0;
     {
         std::unique_lock<std::mutex> lk(mutex);
-        incoming_bytes = footprint_bytes(incoming);
+        incoming_bytes = footprint_bytes(incoming).bytes;
     }
     if (incoming_bytes <= 0) {
         return;
@@ -1253,7 +1322,7 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
                 if (inst.meta.status != SERVER_MODEL_STATUS_LOADED) {
                     continue;
                 }
-                resident_bytes += footprint_bytes(inst.meta);
+                resident_bytes += footprint_bytes(inst.meta).bytes;
             }
         }
         auto free_bytes = query_free_vram_bytes(resident_bytes);
@@ -1266,8 +1335,28 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
             return; // already enough room
         }
 
+        // YARD EDIT (self.ai#128): pin is a PREFERENCE here, not a veto.
+        //
+        // unload_lru() treats a pin as absolute, because there the alternative is
+        // only "one more model than models_max wanted" -- a bookkeeping limit.
+        // Here the alternative is a real OOM or a refused load, so an absolute pin
+        // would mean a big model becomes permanently unloadable the moment enough
+        // support models are pinned. Measured on the deployed 4090: the two pinned
+        // support models hold 1308 MiB (846 + 462) even at n-gpu-layers=0 -- the
+        // CUDA primary context plus KV/compute buffers -- and the largest model
+        // needs 22784 + 512 margin against a 24564 MiB card. An absolute pin there
+        // refuses it outright.
+        //
+        // So: take the LRU UNPINNED model whenever one exists, and only fall back
+        // to a pinned one when nothing else is left. Support models then survive
+        // every ordinary swap (which is what a pin is for) while the biggest model
+        // still loads when it genuinely needs the whole card. The loop evicts one
+        // per iteration, so the fallback also stays minimal -- it gives up exactly
+        // as many pinned models as the fit requires, not all of them.
         std::string lru_name;
         int64_t lru_last_used = ggml_time_ms();
+        std::string lru_pinned_name;
+        int64_t lru_pinned_last_used = ggml_time_ms();
         {
             std::unique_lock<std::mutex> lk(mutex);
             for (const auto & [key, inst] : mapping) {
@@ -1279,11 +1368,41 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
                 if (inst.meta.status != SERVER_MODEL_STATUS_LOADED) {
                     continue;
                 }
+                if (inst.meta.pinned) {
+                    if (lru_pinned_name.empty() || inst.meta.last_used < lru_pinned_last_used) {
+                        lru_pinned_name = key;
+                        lru_pinned_last_used = inst.meta.last_used;
+                    }
+                    continue;
+                }
                 if (lru_name.empty() || inst.meta.last_used < lru_last_used) {
                     lru_name = key;
                     lru_last_used = inst.meta.last_used;
                 }
             }
+        }
+
+        bool overriding_pin = false;
+        if (lru_name.empty() && !lru_pinned_name.empty()) {
+            // Ordered BEFORE the expert-layer shed below, deliberately. The shed
+            // degrades the INCOMING model for its whole residency -- and the
+            // incoming model is the hot path, the thing a user waits on token by
+            // token. Overriding a pin costs one cold reload of a support model the
+            // next time something reranks or embeds. On a card dedicated to
+            // serving, a permanently slower chat model is the worse trade.
+            //
+            // This also keeps #29's stated invariant intact: the shed is still the
+            // last thing tried before refusing, and still "competes with a
+            // refusal, never with a cheaper option" -- overriding a pin is simply
+            // one of the cheaper options that now comes first.
+            //
+            // Last resort. WARN rather than INFO: a pin was asked for and is not
+            // being honoured, and the operator's recourse (shrink the pinned set,
+            // or the incoming model) is only findable if this is visible.
+            SRV_WRN("vram-aware eviction: no unpinned model left to evict; overriding the pin on "
+                    "name=%s to fit name=%s\n", lru_pinned_name.c_str(), incoming.name.c_str());
+            lru_name = lru_pinned_name;
+            overriding_pin = true;
         }
 
         if (lru_name.empty()) {
@@ -1294,16 +1413,29 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
             // are called before load() takes its own lock and before any child instance exists,
             // and the LRU-scan lock above is already released here, so no lock is held. ex_wrapper
             // maps this to a structured HTTP 503 (T-006).
+            // Issue #29: before refusing, try to make the model FIT by pushing more
+            // expert layers to system RAM. "Slower but serving" beats "gone" --
+            // shedding is the whole point of having an MoE offload knob.
+            //
+            // Only reachable when nothing else can be evicted, so this competes with
+            // a refusal, never with a cheaper option.
+            // Budget is free MINUS the margin, mirroring the fit test above
+            // (incoming + margin <= free). Passing free + margin would under-shed
+            // by twice the margin and hand the child a config that still OOMs.
+            if (try_shed_to_fit(incoming, incoming_bytes, *free_bytes - margin_bytes)) {
+                return; // respawn will use the shed config; the load proceeds
+            }
             throw server_model_vram_unfittable_error(incoming.name, incoming_bytes, *free_bytes);
         }
 
         SRV_INF("vram-aware eviction: %lld MiB free < needed %lld MiB (est. %lld MiB + %d MiB margin), "
-                "evicting LRU model name=%s\n",
+                "evicting LRU model name=%s%s\n",
                 (long long) (*free_bytes / (1024 * 1024)),
                 (long long) ((incoming_bytes + margin_bytes) / (1024 * 1024)),
                 (long long) (incoming_bytes / (1024 * 1024)),
                 base_params.models_vram_margin_mb,
-                lru_name.c_str());
+                lru_name.c_str(),
+                overriding_pin ? " (PINNED -- no unpinned candidate left)" : "");
 
         unload(lru_name);
         // wait for unload to complete
@@ -1318,6 +1450,86 @@ void server_models::evict_for_vram(const server_model_meta & incoming) {
     }
 }
 
+// Push more expert layers to system RAM so a model that does not fit, fits
+// (issue #29). Returns true when the model's config was rewritten and the load
+// should proceed; false when we cannot size a shed and the caller should refuse.
+//
+// The lever is -ncmoe, which is applied strictly at LOAD time -- the tensor's
+// buffer is chosen when it is created and there is no ggml API to move an
+// allocated tensor between backends. So this is not a "warm rebalance" of a
+// resident model: it rewrites the config of a model that is about to spawn.
+// That is exactly why it is cheap (pure orchestration, no llama-internals
+// surgery) and why it is only useful here, on the not-yet-loaded path.
+//
+// Sizing is operator-declared via vram-shed-mib-per-layer. A linear model is
+// crude, but it is anchored on a measured point and only has to get us over a
+// threshold the child then re-checks for itself -- llama-server still refuses
+// or OOMs on its own terms if this lands short, so an optimistic estimate
+// cannot turn a refusal into silent corruption.
+bool server_models::try_shed_to_fit(const server_model_meta & incoming,
+                                    int64_t needed_bytes,
+                                    int64_t budget_bytes) {
+    const int64_t per_layer_mib = shed_mib_per_layer(incoming);
+    if (per_layer_mib <= 0) {
+        return false; // no claim -> refuse, exactly as before #29
+    }
+    const int64_t per_layer_bytes = per_layer_mib * 1024 * 1024;
+
+    const int64_t deficit = needed_bytes - budget_bytes;
+    if (deficit <= 0) {
+        return false; // not the shortfall case; nothing to do
+    }
+
+    // Round UP: shedding half a layer is not a thing, and landing one layer
+    // heavy is an OOM while landing one layer light is only slower.
+    const int64_t extra_layers = (deficit + per_layer_bytes - 1) / per_layer_bytes;
+    const int current = current_n_cpu_moe(incoming);
+    const int64_t shed_bytes = extra_layers * per_layer_bytes;
+
+    // The declaration must move with the config it describes. Leaving the old
+    // figure on a shed model would re-refuse it on the next load for a size it
+    // no longer has. If shedding would take the declared footprint to zero the
+    // linear model has been extrapolated past where it means anything -- refuse
+    // rather than spawn a child on a number we do not believe.
+    const int64_t declared = declared_footprint_bytes(incoming);
+    if (declared > 0 && declared - shed_bytes <= 0) {
+        SRV_INF("vram shed: model name=%s needs %lld more layers on CPU than its declared "
+                "footprint can account for; refusing rather than guessing\n",
+                incoming.name.c_str(), (long long) extra_layers);
+        return false;
+    }
+
+    const int new_ncmoe = current + (int) extra_layers;
+
+    SRV_INF("vram shed: model name=%s does not fit (needs %lld MiB, budget %lld MiB); "
+            "moving %lld more expert layer(s) to system RAM (-ncmoe %d -> %d, "
+            "%lld MiB/layer). SLOWER BUT SERVING -- this is issue #29's degrade path, "
+            "not a measurement\n",
+            incoming.name.c_str(),
+            (long long) (needed_bytes / (1024 * 1024)),
+            (long long) (budget_bytes / (1024 * 1024)),
+            (long long) extra_layers, current, new_ncmoe,
+            (long long) per_layer_mib);
+
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(incoming.name);
+        if (it == mapping.end()) {
+            return false;
+        }
+        auto & meta = it->second.meta;
+        meta.preset.set_option(ctx_preset, "LLAMA_ARG_N_CPU_MOE", std::to_string(new_ncmoe));
+        if (declared > 0) {
+            meta.preset.set_option(ctx_preset, COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB,
+                                   std::to_string((declared - shed_bytes) / (1024 * 1024)));
+        }
+        // Re-render argv so the child actually spawns with the shed setting. Without
+        // this the preset says one thing and the process another.
+        meta.update_args(ctx_preset, bin_path);
+    }
+    return true;
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -1326,11 +1538,25 @@ void server_models::unload_lru() {
     std::string lru_model_name = "";
     int64_t lru_last_used = ggml_time_ms();
     size_t count_active = 0;
+    size_t count_pinned = 0;
     {
         std::unique_lock<std::mutex> lk(mutex);
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
                 count_active++;
+                // YARD EDIT (self.ai#128): a pinned model is counted but never
+                // chosen. Support models -- the embedder, the reranker -- are by
+                // nature the least recently used things running, because nothing
+                // touches them between requests. Plain LRU therefore evicts
+                // exactly the models that must stay resident, and the eviction is
+                // silent: the next embedding request simply reloads and pays the
+                // latency. Counting them still is the whole point of a pin -- it
+                // reserves a slot rather than conjuring one, so the VRAM
+                // arithmetic and models_max keep meaning what they say.
+                if (m.second.meta.pinned) {
+                    count_pinned++;
+                    continue;
+                }
                 if (m.second.meta.last_used < lru_last_used) {
                     lru_model_name = m.first;
                     lru_last_used = m.second.meta.last_used;
@@ -1338,8 +1564,17 @@ void server_models::unload_lru() {
             }
         }
     }
+    if (lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
+        // Every running model is pinned, so there is nothing this function may
+        // evict. Say so: load() will throw "model limit reached" a moment later,
+        // and without this line the cause -- an over-pinned preset, not a busy
+        // router -- is invisible.
+        SRV_WRN("models_max (%d) reached and all %zu running models are pinned; "
+            "nothing is evictable\n", base_params.models_max, count_pinned);
+    }
     if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        SRV_INF("models_max limit reached, removing LRU name=%s (%zu pinned, exempt)\n",
+            lru_model_name.c_str(), count_pinned);
         unload(lru_model_name);
         // wait for unload to complete
         {
@@ -2287,6 +2522,25 @@ void server_models_routes::init_routes() {
                 // {"need_download", meta.need_download},
                 // TODO: add other fields, may require reading GGUF metadata
             };
+
+            // How much of the card this configuration takes, and how we know
+            // (self.ai#107). OMITTED ENTIRELY when unknown -- a `null` or a 0
+            // here would read as "this model is free", and a consumer sizing a
+            // VRAM lease off that would ask for nothing and be granted it.
+            // Absence is the honest encoding of absence.
+            //
+            // This exists so self.ai can request a broker lease of the right
+            // size BEFORE asking us to load. Without it core has no figure at
+            // all, so its only options are to guess or to skip the broker --
+            // and skipping is what left lower-priority holders immovable while
+            // llamolotl, the highest-priority consumer, OOM'd around them.
+            const footprint_info fp = models.footprint_report(meta);
+            if (fp.bytes > 0 && fp.source != nullptr) {
+                model_info["vram_footprint"] = json {
+                    {"bytes",  fp.bytes},
+                    {"source", fp.source},
+                };
+            }
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {

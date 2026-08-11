@@ -72,8 +72,12 @@ variables:
 # `COPY . .` could bake it into the image (gitlab-profile#60 trap 3). --root
 # points build bytes at the /builds mount, off the node containerd root (#143).
 .buildkit-before: &buildkit-before
-  - export BK_SCRATCH="${CI_BUILDS_DIR:-/builds}/.buildkit"
-  - mkdir -p "$BK_SCRATCH" 2>/dev/null || export BK_SCRATCH="$(dirname "$CI_PROJECT_DIR")/.buildkit"
+  # PER-PROJECT state root (#41). The shared "/builds/.buildkit" is per-RUNNER,
+  # so every project landing on bigbuild shared one buildkitd lock -- and
+  # `resource_group` is project-scoped and cannot see another project. Suffixing
+  # the project makes the resource match the scope of the lock that guards it.
+  - export BK_SCRATCH="${CI_BUILDS_DIR:-/builds}/.buildkit-${CI_PROJECT_PATH_SLUG}"
+  - mkdir -p "$BK_SCRATCH" 2>/dev/null || export BK_SCRATCH="$(dirname "$CI_PROJECT_DIR")/.buildkit-${CI_PROJECT_PATH_SLUG}"
   - mkdir -p "$BK_SCRATCH/state" "$BK_SCRATCH/docker"
   - export DOCKER_CONFIG="$BK_SCRATCH/docker"
   - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > "$DOCKER_CONFIG/config.json"
@@ -81,24 +85,42 @@ variables:
   - export BUILDKITD_FLAGS="--oci-worker-no-process-sandbox --root $BK_SCRATCH/state"
 
 # Every job that starts a buildkitd against $BK_SCRATCH carries
-# `resource_group: buildkit`, which serialises them project-wide (#41).
+# `resource_group: buildkit`, which serialises them PROJECT-WIDE (#41). That is
+# necessary and, on its own, was NOT sufficient -- see below.
 #
-# BK_SCRATCH is GROUP-level -- /builds/<runner>/0/selfshipyard/selfai/.buildkit
-# -- and buildkitd takes an exclusive lock on state/buildkitd.lock. Two of our
-# build (or publish) jobs landing on the runner together therefore cannot both
-# start a daemon: one wins the lock, the other either dies immediately or blocks
-# on it. Pipeline 6798 got one of each -- build:training failed at 10.8s with
-# "could not lock ... another instance running?" while build:llama-server hung
-# at the first line of its script and burned the full 2h timeout on the yard's
-# only big-build runner, for a commit that had built clean 25 minutes earlier.
-# The behaviour is timing-dependent, which is why it had not bitten before.
+# buildkitd takes an exclusive lock on state/buildkitd.lock, so two jobs sharing
+# a state root cannot both start a daemon: one wins, the other either dies
+# immediately or blocks on it. Pipeline 6798 got one of each -- build:training
+# failed at 10.8s with "could not lock ... another instance running?" while
+# build:llama-server hung at the first line of its script and burned the full 2h
+# timeout on the yard's only big-build runner, for a commit that had built clean
+# 25 minutes earlier. Timing-dependent, which is why it does not bite every run.
+#
+# 2026-08-05: it recurred with resource_group already in place, because the
+# collision is CROSS-PROJECT. The old root was "${CI_BUILDS_DIR}/.buildkit",
+# which is per-RUNNER, not per-project -- shared by everything that lands on
+# bigbuild. resource_group is project-scoped and structurally cannot serialise
+# against another project. Pipeline 7070 job 32309 died 3s in with "could not
+# connect to ... buildkitd.sock after 10 trials" at 16:05:11 UTC, while
+# selfshipyard/self.forge's sidekiq:publish started on the SAME runner at
+# 12:05:29 -04:00 -- the same second.
+#
+# So the root is now per-project (BK_SCRATCH above). That makes the resource
+# match the scope of the lock guarding it: resource_group serialises this
+# project's jobs, and no other project shares the root any more. Cost is one
+# additional cache root on a scratch PVC that has been filled once before
+# (150Gi, ~66% at the time of writing) -- accepted deliberately, and the reason
+# the earlier per-JOB split was rejected. Per-PROJECT is one extra root rather
+# than one per job, which is what makes the disk arithmetic tolerable.
+#
+# NOTE this does not help two OTHER projects colliding with each other on the
+# shared root; it only removes llamolotl from that pool. A general fix belongs
+# in the runner config, not here.
 #
 # resource_group rather than `needs:` on purpose: it holds regardless of stage
 # (the publish jobs race each other on main in exactly the same way), and it
 # does not touch rules -- adding a needs edge between differently-gated jobs is
-# what made main's pipeline uncreatable in !43. Splitting BK_SCRATCH per job
-# would also remove the race, but this scratch PVC has already been filled once
-# by the caches that live there.
+# what made main's pipeline uncreatable in !43.
 #
 # Only serialises within this project. Another selfai project building at the
 # same moment can still collide on the same lock; that needs the shared

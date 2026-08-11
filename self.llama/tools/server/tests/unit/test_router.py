@@ -532,7 +532,8 @@ def test_router_vram_aware_unfittable_autoload_chat_returns_503():
 SPLIT_PRESET_MODEL = "model-ncmoe-declared"
 
 
-def _write_split_preset(path: str, declared_mib: int | None) -> None:
+def _write_split_preset(path: str, declared_mib: int | None,
+                        shed_mib_per_layer: int | None = None) -> None:
     """A preset whose n-cpu-moe disqualifies the file-size estimate, optionally
     carrying a declared footprint. stories15M_MOE is used because it is the one
     cached test model with experts for -ncmoe to act on; the repo/file pair is
@@ -547,6 +548,8 @@ def _write_split_preset(path: str, declared_mib: int | None) -> None:
     ]
     if declared_mib is not None:
         lines.append(f"vram-footprint-mib = {declared_mib}\n")
+    if shed_mib_per_layer is not None:
+        lines.append(f"vram-shed-mib-per-layer = {shed_mib_per_layer}\n")
     with open(path, "w") as f:
         f.writelines(lines)
 
@@ -703,6 +706,131 @@ def test_router_unusable_declaration_is_treated_as_absent(declared):
     try:
         _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
         assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+# ── Publishing the footprint on /v1/models (self.ai#107) ───────────────
+#
+# self.ai has to size a VRAM lease request BEFORE asking us to load, and it has
+# no way to compute a footprint itself. Publishing ours is what lets it ask the
+# broker for the right amount instead of guessing or -- as it does today --
+# skipping the broker entirely and OOMing around lower-priority holders.
+#
+# `source` is published alongside `bytes` because the two are not
+# interchangeable: "measured" is what a child reported, "estimated" is a file
+# size times an overhead percentage. Anything about to reclaim another tenant's
+# VRAM on the strength of this number should be able to tell which it got.
+
+
+def _footprint_of(model_id: str):
+    """The published vram_footprint object for `model_id`, or None if the key is
+    absent (which is how UNKNOWN is encoded -- deliberately not a null or a 0)."""
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    entry = next(m for m in res.body["data"] if m["id"] == model_id)
+    return entry.get("vram_footprint")
+
+
+def test_router_publishes_a_declared_footprint():
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_publish_declared.ini")
+    _write_split_preset(preset_path, declared_mib=4096)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 999_999
+    server.start()
+
+    try:
+        fp = _footprint_of(SPLIT_PRESET_MODEL)
+        assert fp is not None, "a declared footprint must be published"
+        assert fp["bytes"] == 4096 * 1024 * 1024
+        assert fp["source"] == "declared"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_omits_the_footprint_when_it_is_unknown():
+    """The important half. A 0 or a null would read as "this model is free", and
+    a consumer sizing a lease off that would ask for nothing and get it. Absence
+    of information is encoded as absence of the key.
+
+    n-cpu-moe with no declaration is exactly that case: the file-size estimate
+    disqualifies itself (#39) and nothing has been measured."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_publish_unknown.ini")
+    _write_split_preset(preset_path, declared_mib=None)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 999_999
+    server.start()
+
+    try:
+        res = server.make_request("GET", "/models")
+        entry = next(m for m in res.body["data"] if m["id"] == SPLIT_PRESET_MODEL)
+        assert "vram_footprint" not in entry, \
+            f"unknown must be absent, not published as a value: {entry.get('vram_footprint')!r}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_publishes_an_estimated_footprint_for_a_cached_dense_model():
+    """A dense model keeps nothing in system RAM, so the file-size estimate is a
+    legitimate upper bound and gets published as `estimated` -- distinguishable
+    from a real measurement by the source field alone.
+
+    Note what is NOT asserted here. The estimate resolves an HF-repo preset to
+    its cache path offline (#31), so a model that has never been fetched reports
+    unknown -- but CI points LLAMA_CACHE at a PERSISTENT /opt/llama-cache that
+    ServerPreset.load_all() has already populated, so there is no never-fetched
+    state to observe. The unknown case is covered by
+    test_router_omits_the_footprint_when_it_is_unknown instead, which reaches it
+    through the -ncmoe gate rather than through an empty cache."""
+    global server
+    server.models_max = 4
+    server.fake_free_vram_mb = 999_999
+    server.start()
+
+    model = VRAM_CANDIDATE_MODELS[0]
+    fp = _footprint_of(model)
+    assert fp is not None, "a cached dense model has a file size to estimate from"
+    assert fp["source"] == "estimated", \
+        f"CI has a stub CUDA driver so nothing is ever measured here; got {fp!r}"
+    assert fp["bytes"] > 0
+
+    # and it stays estimated after a load: on a real card the child would report
+    # a measurement here and the source would flip (see the next test, which
+    # supplies that reading through the fake hook)
+    _load_model_and_wait(model, timeout=120)
+    assert _footprint_of(model)["source"] == "estimated"
+
+
+def test_router_publishes_a_measurement_in_preference_to_a_declaration():
+    """Precedence has to be visible, not just internal: a model carrying a
+    declaration that has since been measured must publish the MEASUREMENT, or a
+    consumer reading this would size its lease off a stale operator claim.
+
+    fake_measured_mib is required here for the same reason as in
+    test_router_measurement_outranks_a_stale_declaration -- CI's stub CUDA
+    driver means children report "memory": [] and nothing is ever measured."""
+    global server
+    server.models_max = 4
+    server.fake_measured_mib = 64
+    preset_path = os.path.join(TMP_DIR, "test_router_publish_measured.ini")
+    _write_split_preset(preset_path, declared_mib=4096)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 999_999
+    server.start()
+
+    try:
+        before = _footprint_of(SPLIT_PRESET_MODEL)
+        assert before["source"] == "declared" and before["bytes"] == 4096 * 1024 * 1024
+
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+
+        after = _footprint_of(SPLIT_PRESET_MODEL)
+        assert after["source"] == "measured", f"measurement must win over a declaration: {after!r}"
+        assert after["bytes"] == 64 * 1024 * 1024
     finally:
         os.remove(preset_path)
 
@@ -1157,3 +1285,428 @@ def test_router_explicit_cancel_targets_correct_worker():
         })
     t_a.join(timeout=10)
     t_b.join(timeout=10)
+
+
+####################
+# issue #29 -- shed expert layers instead of refusing the load
+####################
+
+
+def _child_args(model_id: str) -> list[str]:
+    """The argv the router rendered for a model, from /v1/models. This is what
+    proves a shed reached the CHILD rather than only the router's bookkeeping."""
+    res = server.make_request("GET", "/v1/models")
+    for model in res.body["data"]:
+        if model["id"] == model_id:
+            return (model.get("status") or {}).get("args", []) or []
+    raise AssertionError(f"{model_id!r} not in /v1/models")
+
+
+def _ncmoe_of(model_id: str) -> int:
+    args = _child_args(model_id)
+    for flag in ("--n-cpu-moe", "-ncmoe"):
+        if flag in args:
+            return int(args[args.index(flag) + 1])
+    return 0
+
+
+def test_router_sheds_expert_layers_instead_of_refusing():
+    """The point of #29: 'slower but serving' beats 'gone'. A card too small for
+    the declared footprint used to raise the terminal 503; with a per-layer shed
+    cost declared, the router pushes more experts to system RAM and loads."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_shed.ini")
+    # The gap must be CLOSABLE, or the "do not extrapolate past meaning" guard
+    # correctly refuses instead and this asserts a shed that cannot happen.
+    # With the 512 MiB default margin:
+    #     budget  = free - 512          = 2048 - 512 = 1536
+    #     deficit = declared - budget   = 4096 - 1536 = 2560
+    #     layers  = ceil(2560 / 512)    = 5
+    #     guard   : 4096 - 5*512 = 1536 > 0  -> shed is sized, load proceeds
+    # A 1 MiB card would need 9 layers (4608 MiB) -- more than the model's whole
+    # declared footprint -- which is a refusal, not a shed.
+    _write_split_preset(preset_path, declared_mib=4096, shed_mib_per_layer=512)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 2048
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _get_model_status(SPLIT_PRESET_MODEL) == "loaded", \
+            "a model with a declared shed cost must degrade, not be refused"
+        assert _ncmoe_of(SPLIT_PRESET_MODEL) > 1, \
+            "the shed must reach the child's argv, not just the router's preset"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_without_a_shed_cost_still_refuses():
+    """The declared shed cost is what makes the degrade path reachable. Without
+    it the model is sized but unsheddable, and refusing is still correct --
+    guessing a per-layer cost is how #36 got filed."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_no_shed.ini")
+    _write_split_preset(preset_path, declared_mib=4096, shed_mib_per_layer=None)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 1
+    server.start()
+
+    try:
+        res = server.make_request("POST", "/models/load", data={"model": SPLIT_PRESET_MODEL})
+        assert res.status_code == 503, f"expected the terminal refusal, got {res.status_code}"
+        msg = json.dumps(res.body)
+        assert "does not fit in VRAM" in msg, f"unexpected error wording: {msg!r}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_refuses_when_shedding_cannot_close_the_gap():
+    """A per-layer cost so small that closing the gap would take the declared
+    footprint to zero means the linear model has been extrapolated past where it
+    means anything. Refuse rather than spawn a child on a number we do not
+    believe -- an over-optimistic shed is an OOM, which is the outage #29 exists
+    to avoid."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_shed_hopeless.ini")
+    _write_split_preset(preset_path, declared_mib=4096, shed_mib_per_layer=1)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 1
+    server.start()
+
+    try:
+        res = server.make_request("POST", "/models/load", data={"model": SPLIT_PRESET_MODEL})
+        assert res.status_code == 503, f"expected a refusal, got {res.status_code}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_shed_declaration_does_not_reach_the_child():
+    """vram-shed-mib-per-layer is preset-only, like vram-footprint-mib. Leaking
+    it into argv would make llama-server reject an unknown flag and fail every
+    load of a model that declares one."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_shed_leak.ini")
+    _write_split_preset(preset_path, declared_mib=4096, shed_mib_per_layer=512)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 65536  # roomy: no shed, so argv is the plain render
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        args = _child_args(SPLIT_PRESET_MODEL)
+        assert not any("shed" in a for a in args), f"shed declaration leaked into argv: {args}"
+        assert not any("vram-footprint" in a for a in args), f"footprint leaked into argv: {args}"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_does_not_shed_a_model_that_already_fits():
+    """The shed is the last thing tried before refusing, never an optimisation.
+    A model with room must spawn with exactly the operator's n-cpu-moe."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_shed_unneeded.ini")
+    _write_split_preset(preset_path, declared_mib=64, shed_mib_per_layer=512)
+    server.models_preset = preset_path
+    server.fake_free_vram_mb = 65536
+    server.start()
+
+    try:
+        _load_model_and_wait(SPLIT_PRESET_MODEL, timeout=120)
+        assert _ncmoe_of(SPLIT_PRESET_MODEL) == 1, \
+            "a fitting model must keep the declared n-cpu-moe untouched"
+    finally:
+        os.remove(preset_path)
+
+
+# ── pin: LRU must not evict the support models (self.ai#128) ────────────
+#
+# The bug this closes is quiet rather than loud. An embedder and a reranker are
+# by nature the LEAST recently used things running: nothing touches them between
+# requests, while the chat model is used constantly. Plain LRU therefore picks
+# exactly the models that must stay resident, and nobody notices until the next
+# embedding request pays a cold load. `pin = 1` in the preset exempts a model
+# from being CHOSEN as the victim; it still COUNTS toward models_max, because a
+# pin reserves a slot rather than conjuring one.
+
+# Named for what they stand in for, not for what they are: the point of every
+# test below is which ROLE gets evicted. All four are cached presets -- the test
+# server runs --offline, so anything else answers 404 to /models/load.
+PIN_EMBEDDER = "pin-embedder"
+PIN_CHAT_A = "pin-chat-a"
+PIN_CHAT_B = "pin-chat-b"
+
+
+def _write_pin_preset(path: str, pin_embedder: bool, also_pin_chat_a: bool = False) -> None:
+    """One embedder plus two chat models, with the embedder optionally pinned.
+
+    The `pin_embedder=False` variant is not dead weight -- it is the control that
+    proves the eviction being asserted is really LRU order and really changed by
+    the pin, rather than something incidental about load sequence.
+    """
+    lines = [
+        f"[{PIN_EMBEDDER}]\n",
+        "hf-repo = ggml-org/models\n",
+        "hf-file = bert-bge-small/ggml-model-f16.gguf\n",
+        "embeddings = 1\n",
+    ]
+    if pin_embedder:
+        lines.append("pin = 1\n")
+    lines += [
+        f"\n[{PIN_CHAT_A}]\n",
+        "hf-repo = ggml-org/test-model-stories260K\n",
+    ]
+    if also_pin_chat_a:
+        lines.append("pin = 1\n")
+    lines += [
+        f"\n[{PIN_CHAT_B}]\n",
+        "hf-repo = ggml-org/test-model-stories260K-infill\n",
+    ]
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+
+def test_router_unpinned_embedder_is_evicted_first():
+    """The control, and the bug being fixed. Loaded first and never touched
+    again, the embedder is the LRU entry, so a second chat model evicts it."""
+    global server
+    server.models_max = 2
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_control.ini")
+    _write_pin_preset(preset_path, pin_embedder=False)
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        _load_model_and_wait(PIN_CHAT_A, timeout=120)
+        _load_model_and_wait(PIN_CHAT_B, timeout=120)
+
+        assert _get_model_status(PIN_EMBEDDER) == "unloaded", \
+            "without a pin the idle embedder is the LRU victim -- if this ever " \
+            "stops holding, the pin test below proves nothing"
+        assert _get_model_status(PIN_CHAT_B) == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_pinned_embedder_survives_a_chat_model_swap():
+    """The fix: same load order, same models_max, `pin = 1` on the embedder.
+    The swap now costs chat-a -- the thing actually being replaced -- and the
+    embedder stays resident."""
+    global server
+    server.models_max = 2
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_survives.ini")
+    _write_pin_preset(preset_path, pin_embedder=True)
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        _load_model_and_wait(PIN_CHAT_A, timeout=120)
+        _load_model_and_wait(PIN_CHAT_B, timeout=120)
+
+        assert _get_model_status(PIN_EMBEDDER) == "loaded", \
+            "a pinned model must never be chosen as the LRU victim"
+        assert _get_model_status(PIN_CHAT_B) == "loaded"
+        assert _get_model_status(PIN_CHAT_A) == "unloaded", \
+            "the eviction must still happen -- to the unpinned model"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_pin_reserves_a_slot_it_does_not_create_one():
+    """A pin is an exemption from eviction, NOT extra capacity. With every slot
+    pinned there is no victim, so the load is refused rather than quietly
+    exceeding models_max and over-committing the card."""
+    global server
+    server.models_max = 2
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_no_victim.ini")
+    _write_pin_preset(preset_path, pin_embedder=True, also_pin_chat_a=True)
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        _load_model_and_wait(PIN_CHAT_A, timeout=120)
+
+        res = server.make_request("POST", "/models/load", data={"model": PIN_CHAT_B})
+        assert res.status_code != 200, \
+            f"models_max must hold when nothing is evictable, got {res.status_code}: {res.body}"
+
+        # Both pinned models are untouched -- a refused load must not have
+        # evicted anything on its way to failing.
+        assert _get_model_status(PIN_EMBEDDER) == "loaded"
+        assert _get_model_status(PIN_CHAT_A) == "loaded"
+        assert _get_model_status(PIN_CHAT_B) == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_pin_does_not_reach_the_child():
+    """pin is preset-only. If it leaked into the child's argv, llama-server
+    would reject the unknown flag and every pinned model would fail to start --
+    so this asserts the load SUCCEEDS, not merely that the string is absent."""
+    global server
+    server.models_max = 4
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_child_argv.ini")
+    _write_pin_preset(preset_path, pin_embedder=True)
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        assert _get_model_status(PIN_EMBEDDER) == "loaded"
+        args = _child_args(PIN_EMBEDDER)
+        # Matched exactly, not by substring: argv carries cache paths, and a
+        # bare "pin" in a filename would fail this test for no reason.
+        assert not any(a == "--pin" or a.startswith("--pin=") for a in args), \
+            f"preset-only option leaked into the child argv: {args!r}"
+    finally:
+        os.remove(preset_path)
+
+
+# ── pin under VRAM pressure: a preference, not a veto (self.ai#128) ──────
+#
+# unload_lru() treats a pin as absolute -- there the alternative is only
+# exceeding a bookkeeping limit. evict_for_vram() must not, because there the
+# alternative is a refused load: measured on the deployed 4090 the two pinned
+# support models hold 1308 MiB even at n-gpu-layers=0 (CUDA context plus
+# KV/compute buffers), and an absolute pin would make the largest model
+# permanently unloadable. So: prefer unpinned, fall back to pinned only when
+# nothing else is left.
+
+
+def _write_pin_solo_preset(path: str) -> None:
+    """One PINNED model and one unpinned model -- the fallback fixture. With
+    only the pinned one resident, a load that needs the room has no unpinned
+    candidate to take.
+
+    Roles are assigned by SIZE, not by what the model is for: the pinned entry
+    must be the SMALLER of the two. The capacity this test aims at is
+    `incoming + pinned // 2`, so a pinned model larger than the incoming one
+    cannot even be loaded into it in the first place. Measured under
+    VRAM_TEST_OVERHEAD_PCT, stories260K estimates at 11 MiB and bert-bge-small
+    at 254 MiB -- so stories260K is the pinned one here, and the embedder plays
+    the incoming model. That is the reverse of the deployment's roles and the
+    reverse of the sibling test above; the mechanism under test is the eviction
+    choice, which does not care what a model is used for.
+    """
+    with open(path, "w") as f:
+        f.writelines([
+            f"[{PIN_CHAT_A}]\n",
+            "hf-repo = ggml-org/test-model-stories260K\n",
+            "pin = 1\n",
+            f"\n[{PIN_EMBEDDER}]\n",
+            "hf-repo = ggml-org/models\n",
+            "hf-file = bert-bge-small/ggml-model-f16.gguf\n",
+            "embeddings = 1\n",
+        ])
+
+
+def test_router_vram_eviction_prefers_the_unpinned_model():
+    """With an unpinned model available, VRAM pressure must take THAT one --
+    even though the pinned support model is older and is what plain LRU would
+    pick. This is the bug: unload_lru() was taught about pins and
+    evict_for_vram() was not, so a pinned model still got evicted by the other
+    door."""
+    global server
+    server.models_max = 4  # high: count-based eviction must never interfere here
+    server.models_vram_margin_mb = 0
+    server.models_vram_overhead_pct = VRAM_TEST_OVERHEAD_PCT
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_vram_prefers.ini")
+    _write_pin_preset(preset_path, pin_embedder=True)
+    server.models_preset = preset_path
+    total_file = os.path.join(TMP_DIR, "test_router_pin_vram_prefers_total.txt")
+    _write_total_vram_mb(total_file, 999_999)
+    server.fake_total_vram_mb_file = total_file
+    server.start()
+
+    try:
+        est = {m: _prime_and_measure(m, total_file)
+               for m in (PIN_EMBEDDER, PIN_CHAT_A, PIN_CHAT_B)}
+        # `first` must be the larger chat model: after it alone is evicted,
+        # `second` has to fit in what is left.
+        first, second = sorted((PIN_CHAT_A, PIN_CHAT_B), key=lambda m: est[m], reverse=True)
+        assert est[second] >= 4, \
+            f"{second} estimates at only {est[second]} MiB -- raise VRAM_TEST_OVERHEAD_PCT"
+
+        #   load pinned -> free = total                     >= pinned    fits
+        #   load first  -> free = total - pinned            >= first     fits
+        #   load second -> free = second // 2               <  second    does NOT fit
+        #   evict first -> free = first + second // 2       >= second    fits
+        total = est[PIN_EMBEDDER] + est[first] + est[second] // 2
+        _write_total_vram_mb(total_file, total)
+
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        _load_model_and_wait(first, timeout=120)
+        _load_model_and_wait(second, timeout=120)
+
+        assert _get_model_status(PIN_EMBEDDER) == "loaded", \
+            "VRAM pressure took the pinned model while an unpinned one was available"
+        assert _get_model_status(first) == "unloaded", \
+            "the unpinned model is the one that should have paid for the room"
+        assert _get_model_status(second) == "loaded"
+    finally:
+        for p in (preset_path, total_file):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def test_router_vram_eviction_falls_back_to_a_pinned_model():
+    """When NOTHING unpinned is left, the pin yields rather than refusing the
+    load. Deliberate, and the reason this differs from unload_lru(): an
+    absolute pin here turns 'this model is slower to serve' into 'this model
+    can never load', which is a worse failure than a support model taking a
+    cold start.
+
+    Unlike its sibling above, this one does NOT fail against the unfixed code:
+    with a single resident model, plain LRU evicts it too. It is a guard on the
+    DECISION, not a reproduction of the bug -- it fails the day someone
+    "completes" the pin by making it absolute here."""
+    global server
+    server.models_max = 4
+    server.models_vram_margin_mb = 0
+    server.models_vram_overhead_pct = VRAM_TEST_OVERHEAD_PCT
+    preset_path = os.path.join(TMP_DIR, "test_router_pin_vram_fallback.ini")
+    _write_pin_solo_preset(preset_path)
+    server.models_preset = preset_path
+    total_file = os.path.join(TMP_DIR, "test_router_pin_vram_fallback_total.txt")
+    _write_total_vram_mb(total_file, 999_999)
+    server.fake_total_vram_mb_file = total_file
+    server.start()
+
+    try:
+        # PIN_CHAT_A is the PINNED one here and PIN_EMBEDDER the incoming --
+        # roles assigned by size, see _write_pin_solo_preset.
+        est_pin = _prime_and_measure(PIN_CHAT_A, total_file)
+        est_incoming = _prime_and_measure(PIN_EMBEDDER, total_file)
+        assert est_pin >= 2, \
+            f"{PIN_CHAT_A} estimates at only {est_pin} MiB -- raise VRAM_TEST_OVERHEAD_PCT; " \
+            "below 2 MiB the pin // 2 aiming window collapses"
+        assert est_incoming >= est_pin, \
+            f"this test needs the incoming model ({est_incoming} MiB) to be no smaller than " \
+            f"the pinned one ({est_pin} MiB) -- the capacity below is sized for the incoming " \
+            "model, so a larger pinned model could not be loaded into it to begin with"
+
+        #   load pinned   -> free = total                    >= pinned    fits
+        #   load incoming -> free = incoming - ceil(pin/2)   <  incoming  does NOT fit
+        #   evict pinned  -> free = incoming + pin // 2      >= incoming  fits
+        total = est_incoming + est_pin // 2
+        _write_total_vram_mb(total_file, total)
+
+        _load_model_and_wait(PIN_CHAT_A, timeout=120)
+        assert _get_model_status(PIN_CHAT_A) == "loaded"
+
+        _load_model_and_wait(PIN_EMBEDDER, timeout=120)
+        assert _get_model_status(PIN_EMBEDDER) == "loaded", \
+            "an absolute pin would have refused this load with the #27 terminal error"
+        assert _get_model_status(PIN_CHAT_A) == "unloaded", \
+            "the pin must yield when it is the only thing left to evict"
+    finally:
+        for p in (preset_path, total_file):
+            if os.path.exists(p):
+                os.remove(p)
