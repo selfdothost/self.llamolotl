@@ -144,8 +144,26 @@ build:llama-server:
   timeout: 2h
   resource_group: buildkit   # see .buildkit-before note (#41)
   before_script: *buildkit-before
+  # #47. Only build when something this image actually consumes changed.
+  # Dockerfile.llama-only COPYs exactly one thing -- `self.llama/` (:15) -- so an
+  # api/-only or context/-only MR was paying a ~22 minute compile for a tree it
+  # did not touch. The list is derived from the COPY lines, not guessed.
+  #
+  # .gitlab-ci.yml is in every one of these lists on purpose: a change to CI
+  # itself must always rebuild, or a broken pipeline edit could hide behind its
+  # own guard.
+  #
+  # SAFE HERE BECAUSE THIS JOB IS MERGE-REQUEST-ONLY. The publish:* jobs below
+  # are main-only and deliberately carry NO changes: guard -- they produce the
+  # deployed image, and on a branch pipeline `changes` compares against the
+  # previous commit rather than a merge base, so a guard there could let a push
+  # to main publish nothing at all. Worst case here is a skipped build on an MR.
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - self.llama/**/*
+        - Dockerfile.llama-only
+        - .gitlab-ci.yml
   script:
     - export TAGS="${IMAGE}:llama-only-${CI_COMMIT_SHORT_SHA},${IMAGE}:llama-only-latest"
     - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
@@ -299,8 +317,105 @@ test:llama-server:
   # pipeline with no jobs looks like nothing happened.
   #
   # The suite is a merge gate. Code on main has already passed it.
+  #
+  # #47: THIS `changes:` LIST MUST STAY BYTE-IDENTICAL TO build:llama-server'S.
+  # This job `needs:` that one, and the paragraph above is the record of what
+  # happens when a needed job is absent from a pipeline: GitLab rejects the
+  # WHOLE pipeline as uncreatable rather than skipping the dependent job. If the
+  # two lists ever diverge, an MR touching a path in one list but not the other
+  # takes down its entire pipeline -- not just this job. Change them together or
+  # not at all.
+  #
+  # Consequence worth stating plainly: on an MR that touches no self.llama/ path,
+  # the vendored C++ suite does not run, so "green" means less on that MR than on
+  # one that rebuilds the server. That is correct -- such an MR cannot affect the
+  # compiled binary -- but anyone widening these paths should re-read this.
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - self.llama/**/*
+        - Dockerfile.llama-only
+        - .gitlab-ci.yml
+
+# --- test: the Python API suite (api/tests/) --------------------------------
+# self.llamolotl#45. Until this job existed NO CI job ran api/tests/ at all --
+# the only pytest in this file is the vendored llama.cpp server suite above. A
+# green pipeline meant "the C++ server suite passed" and said nothing whatsoever
+# about api/. That is how the two stale tests deselected below went red without
+# anyone noticing.
+#
+# Deliberately NOT built on the training image. That image carries the whole ML
+# stack and takes hours to build; this suite needs fastapi + a handful of small
+# libraries, so a plain python image plus pip runs it in seconds. Measured
+# locally: 12s to install, 1.6s to run 148 tests.
+#
+# tags: [yard] OVERRIDES this file's `default: tags: [bigbuild]`. This job
+# compiles nothing -- no llama-server, no DeepSpeed, no CUDA -- it pip-installs
+# a handful of pure-Python libraries and runs pytest for a second and a half.
+# bigbuild is affinity-locked to the GPU node where heavy builds starve behind
+# inference, and even yard-midbuild is more machine than this needs. `yard`
+# (selfshipyard-runner-k8s-01) is what self.ai and self.chat both use as their
+# DEFAULT runner, reserving yard-midbuild for buildkit image builds; this file
+# is the outlier in defaulting everything to bigbuild.
+#
+# needs: [] is load-bearing, not decoration. Stages are sequential, so without
+# it a `test`-stage job waits for the ENTIRE `build` stage -- including
+# build:training, which takes ~90 minutes -- before GitLab will even offer it
+# to a runner. Observed on the first run of this job: 50 minutes sitting in
+# `created` behind a build it does not depend on, where no choice of tag could
+# have helped. An empty needs releases it immediately, in parallel with the
+# builds, which is the whole point of a fast test.
+#
+# Runs on merge requests AND on main -- unlike test:llama-server, which is
+# MR-only because it `needs:` an MR-only build job. This one needs nothing, so
+# main can be gated too.
+#
+# python:3.11-slim matches the runtime's Python MINOR version, but not its
+# patch level, and the difference is not in our favour. The runtime installs
+# Ubuntu 22.04's `python3.11` package, which is still 3.11.0rc1 -- a release
+# candidate, confirmed on the live pod. Docker Hub's python:3.11-slim tracks
+# 3.11.x final, so this job runs on a NEWER interpreter than production does.
+#
+# Pinning to prod's actual rc would mean reproducing a pre-release interpreter
+# in CI to be bug-compatible with it, which is the wrong direction; the fix is
+# to get the runtime onto a supported Python. Tracked in #46.
+test:api:
+  stage: test
+  image: python:3.11-slim
+  tags: [yard]
+  needs: []
+  timeout: 15m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    # Unpinned on purpose: this is a test harness, not the runtime dependency
+    # set. The runtime pins live in the Dockerfile (self.llamolotl#13) and are
+    # what production is built from -- duplicating them here would create a
+    # second list to keep in sync and a false impression that this job proves
+    # something about those versions. huggingface_hub and psutil are not
+    # optional: integrity.py and the watchdog's process-identity checks import
+    # them at module load, and without them 14 tests fail on import alone.
+    - pip install --no-cache-dir fastapi httpx pytest pyjwt aiofiles pyyaml psutil huggingface_hub
+  script:
+    # rootdir is api/ (api/pytest.ini sets testpaths = tests), so node ids are
+    # `tests/...` NOT `api/tests/...` -- a --deselect written with the longer
+    # prefix silently matches nothing and the test runs anyway.
+    - cd "$CI_PROJECT_DIR/api"
+    # tests/test_config.py imports api/train.py, which pulls torch + datasets +
+    # transformers + peft + trl at module load. Running it here would mean
+    # installing the entire training stack to exercise config aliasing and
+    # dataset-format detection, turning a 15-second job into a multi-GB one.
+    # It belongs in a job built on the training image; tracked in #45.
+    #
+    # NOTHING ELSE IS EXCLUDED. Two tests in test_gpu_lease.py were red on main
+    # when this job was written -- both aimed their patches at functions the
+    # code had stopped calling -- and they are repaired in this same commit
+    # rather than deselected. A gate that starts life with an exclusion list
+    # teaches everyone that red tests are normal here.
+    - >
+      pytest tests/ -q
+      --ignore=tests/test_config.py
 
 # --- llama-server (serving-only) : build + push llama-only tags (main) ---
 publish:llama-server:
@@ -331,8 +446,34 @@ build:training:
   timeout: 4h
   resource_group: buildkit   # see .buildkit-before note (#41)
   before_script: *buildkit-before
+  # #47. Derived from Dockerfile's COPY lines: self.llama/ (:47, the llama-builder
+  # stage), api/ (:240), deepspeed_configs/ (:241), chat-templates/ (:229),
+  # supervisord.conf (:226), llama-server-wrapper.sh (:232), entrypoint.sh (:236),
+  # and the Dockerfile itself, which is where the pinned pip stack lives.
+  #
+  # Note this list is BROADER than build:llama-server's -- api/ is an input to
+  # the training image but not to the llama-only one. That asymmetry is the point:
+  # an api/-only MR still builds and tests what it touched, while skipping the
+  # llama-server compile and its suite.
+  #
+  # Not guarded: context/, README.md, CONTRIBUTING.md, NOTICE, LICENSE*. Nothing
+  # in either build references patches/ either -- see #47 on whether that
+  # directory is still live.
+  #
+  # Merge-request-only, so the same reasoning as build:llama-server applies: the
+  # main-only publish:* jobs get no guard.
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - self.llama/**/*
+        - api/**/*
+        - deepspeed_configs/**/*
+        - chat-templates/**/*
+        - supervisord.conf
+        - llama-server-wrapper.sh
+        - entrypoint.sh
+        - Dockerfile
+        - .gitlab-ci.yml
   script:
     - >
       buildctl-daemonless.sh build

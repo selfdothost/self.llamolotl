@@ -2435,6 +2435,26 @@ void server_models_routes::init_routes() {
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
+        if (name.empty()) {
+            // self.llamolotl#44. Taking the target model ONLY from the body
+            // makes every proxied POST route whose child requires a non-object
+            // body unreachable, because there is nowhere to put "model".
+            //
+            // POST /lora-adapters is exactly that: post_lora_adapters
+            // (server-context.cpp) rejects any body that is not a JSON array,
+            // while proxy_request forwards the body to the child VERBATIM. So
+            // an array 400s here for a missing model, and an object carrying
+            // one 400s at the child for not being an array. No body satisfies
+            // both, and runtime LoRA scale changes are unreachable in router
+            // mode as a result.
+            //
+            // Falling back to the ?model= query parameter -- the same place
+            // proxy_get already reads it from -- resolves that without
+            // touching the body, so the child still receives precisely the
+            // payload its handler expects. Body-carried "model" keeps
+            // priority, so no existing caller changes behaviour.
+            name = req.get_param("model");
+        }
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {

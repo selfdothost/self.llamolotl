@@ -44,11 +44,30 @@ class TestProbeVramState:
 
         The two numbers are deliberately different here (3000 MiB vs 4096 MiB):
         core SUMS held across consumers, so reporting the card in that field
-        double-counted every sibling (self.ai#74)."""
+        double-counted every sibling (self.ai#74).
+
+        The footprint is supplied the way the router really supplies it — as a
+        published `memory[]` payload on the model entry (self.llamolotl!41 for
+        #36) — not by stubbing an aggregate. This test used to patch
+        `_lookup_model_size_bytes`, which `_probe_vram_state()` stopped
+        consulting when the figure moved to the published measurement. The
+        patch then aimed at a function no longer on the path, held correctly
+        came back None ("no measured footprint, report unknown rather than
+        understate it"), and the assertion failed. Two devices with all three
+        keys populated, so this exercises the real cross-device sum in
+        `_router_resident_footprints()` instead of trading one stub for
+        another."""
+        mib = 1024 * 1024
+        entry = {
+            "id": "m1",
+            "status": {"value": "loaded"},
+            "memory": [
+                {"model": 1500 * mib, "context": 400 * mib, "compute": 100 * mib},
+                {"model": 800 * mib, "context": 150 * mib, "compute": 50 * mib},
+            ],
+        }
         with patch("api.state.subprocess.run", return_value=_smi(4096, 24576)), \
-             patch("api.state._probe_llama_server_models_status",
-                   return_value=[{"id": "m1", "status": {"value": "loaded"}}]), \
-             patch("api.state._lookup_model_size_bytes", return_value=3000 * 1024 * 1024):
+             patch("api.state._probe_llama_server_models_status", return_value=[entry]):
             s = state._probe_vram_state()
         assert s["held_vram_bytes"] == 3000 * 1024 * 1024
         assert s["device_used_bytes"] == 4096 * 1024 * 1024
@@ -428,11 +447,19 @@ class TestHandleVramRelease:
 class TestVramStateEndpoint:
     def test_authenticated_call_returns_byte_fields(self, client):
         """R1-AC1: an authenticated (system:read) call returns held + total
-        capacity byte fields, plus the currently-loaded model (self.ai!225)."""
+        capacity byte fields, plus the currently-loaded model (self.ai!225).
+
+        `loaded_model` comes from `_primary_loaded_model()`, NOT from
+        `_check_inference_health()`. The endpoint moved off the health probe
+        because this fork's /health returns a bare {"status": "ok"} with no
+        model field in either mode, so the name was structurally always null.
+        This test kept patching the health probe afterwards, which the endpoint
+        no longer calls, so the real `_primary_loaded_model()` ran, found no
+        router, and returned None."""
         with patch("api.routers.system._probe_vram_state",
                    return_value=_vram(4096 * 1024 * 1024)), \
-             patch("api.routers.system._check_inference_health",
-                   return_value=(True, "Qwen2.5-Coder-32B")):
+             patch("api.routers.system._primary_loaded_model",
+                   return_value="Qwen2.5-Coder-32B"):
             resp = client.get("/api/system/vram-state")
         assert resp.status_code == 200
         data = resp.json()
@@ -440,17 +467,22 @@ class TestVramStateEndpoint:
         assert data["total_capacity_bytes"] == 24576 * 1024 * 1024
         assert data["status"] == "ok"
         assert data["gpu_reachable"] is True
-        # The resident model is surfaced from _check_inference_health (self.ai!225).
+        # The resident model is surfaced from _primary_loaded_model (self.ai!225).
         assert data["loaded_model"] == "Qwen2.5-Coder-32B"
 
     def test_unreachable_gpu_distinguishable_not_zero(self, client):
         """R1-AC4: an unreachable GPU returns 200 with a distinguishable
         status and null held — NEVER held_vram_bytes=0. loaded_model is null
-        when nothing is resident."""
+        when nothing is resident.
+
+        Patches `_primary_loaded_model` for the same reason as the test above.
+        This one was not failing, but only by luck: it patched the health probe
+        the endpoint no longer calls, and the unpatched `_primary_loaded_model`
+        happened to return None here anyway. Right answer, wrong reason — it
+        would have kept passing however that function behaved."""
         with patch("api.routers.system._probe_vram_state",
                    return_value=_vram(None, gpu_reachable=False)), \
-             patch("api.routers.system._check_inference_health",
-                   return_value=(False, None)):
+             patch("api.routers.system._primary_loaded_model", return_value=None):
             resp = client.get("/api/system/vram-state")
         assert resp.status_code == 200  # not an error that would hide the signal
         data = resp.json()

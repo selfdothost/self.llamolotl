@@ -386,6 +386,13 @@ class ApplyLorasRequest(BaseModel):
     loras: List[Dict[str, Any]]  # [{"file": "coding-lora.gguf", "scale": 0.7}, ...]
     # If empty list, removes all LoRAs and restarts with base model only
 
+    # Which resident model the adapters belong to. Adapters are per-child state
+    # in router mode, so "the active adapters" is only meaningful relative to a
+    # model (self.llamolotl#44). None resolves to `_primary_loaded_model()`,
+    # which preserves every existing caller's behaviour: they were all aiming
+    # at the one big chat model anyway.
+    model: Optional[str] = None
+
 
 class LoraAdapter(BaseModel):
     path: str  # Path relative to OUTPUTS_DIR
@@ -1357,13 +1364,61 @@ def _check_disk(path: str) -> float:
         return -1.0
 
 
-def _get_active_loras_from_server() -> list:
-    """Query llama-server for active LoRA adapters."""
+def _get_active_loras_from_server(model: Optional[str] = None) -> list:
+    """Query llama-server for the LoRA adapters active on `model`.
+
+    ROUTER MODE REQUIRES THE MODEL NAME (self.llamolotl#44). GET /lora-adapters
+    is one of the router's proxied routes (`server_models_routes::proxy_get`,
+    self.llama/tools/server/server-models.cpp:2423-2432): it reads the target
+    from the `model` QUERY parameter, validates it, and only then forwards to
+    that model's child server. Adapters are per-child state, so there is no
+    "the" adapter set to ask for without naming one.
+
+    Called without it this returned 400 "model name is missing from the
+    request" on every invocation, and the bare `except: return []` below turned
+    that into an empty list indistinguishable from "no adapters loaded". The
+    two consumers both read that as fact: apply_loras concluded nothing was
+    preloaded and took the restart path every single time, and
+    GET /api/system/active-loras fell through to parsing the args file while
+    reporting itself as live server state.
+
+    `model=None` resolves to `_primary_loaded_model()` — the largest resident
+    model, which is the chat model adapters are applied to. None back from that
+    means nothing is resident, so there are no adapters by definition and the
+    empty list is honest rather than a swallowed error.
+
+    Note the router's asymmetry: GET takes `model` in the query string, POST
+    takes it in the JSON body. See `apply_loras` for why POST cannot currently
+    be satisfied at all.
+    """
+    import urllib.error
     import urllib.request
+    from urllib.parse import quote
+
+    if model is None:
+        model = _primary_loaded_model()
+        if model is None:
+            log.debug("active-loras: no model resident, so no adapters to report")
+            return []
+
+    url = f"http://localhost:8080/lora-adapters?model={quote(model, safe='')}"
     try:
-        with urllib.request.urlopen("http://localhost:8080/lora-adapters", timeout=2) as resp:
+        with urllib.request.urlopen(url, timeout=2) as resp:
             return json.loads(resp.read())
-    except Exception:
+    except urllib.error.HTTPError as e:
+        # Deliberately louder than the old bare except: a non-200 here means we
+        # do not know the adapter state, which is NOT the same as knowing there
+        # are none. Callers still get [] (they have no better option), but the
+        # reason is now in the log instead of being erased.
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        log.warning("active-loras: llama-server returned %s for model %r: %s", e.code, model, body)
+        return []
+    except Exception as e:
+        log.warning("active-loras: could not query /lora-adapters for model %r: %s", model, e)
         return []
 
 

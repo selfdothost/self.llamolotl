@@ -1710,3 +1710,89 @@ def test_router_vram_eviction_falls_back_to_a_pinned_model():
         for p in (preset_path, total_file):
             if os.path.exists(p):
                 os.remove(p)
+
+
+# ─── proxy_post: model from the query string (self.llamolotl#44) ────────────
+# proxy_post used to take the target model ONLY from a top-level "model" field
+# in the request body. That makes every proxied POST route whose child handler
+# requires a NON-OBJECT body structurally unreachable, because such a body has
+# nowhere to put "model".
+#
+# POST /lora-adapters is exactly that route. Its child handler
+# (post_lora_adapters, server-context.cpp) rejects any body that is not a JSON
+# array, while proxy_request forwards the body to the child verbatim. Before the
+# fix, both directions failed and runtime LoRA scale changes were impossible in
+# router mode:
+#
+#   POST []                     -> 400 at the ROUTER, "model name is missing"
+#   POST {"model":…,"loras":[]} -> 400 at the CHILD,  "body must be an array"
+#
+# Reproduced live against a deployed router on 2026-08-11 before the fix.
+
+
+# Every request below passes an EXPLICIT timeout. utils.DEFAULT_REQUEST_TIMEOUT
+# is 600s, and the child's post_lora_adapters blocks on rd.next() waiting for a
+# SET_LORA result -- so one unanswered call stalls for ten minutes and a handful
+# would consume the job's entire 45m budget, turning a real failure here into an
+# uninformative job_execution_timeout with nothing in the trace to read. These
+# calls are local and answer in milliseconds when they answer at all, so a
+# bounded wait fails loudly instead of silently eating the pipeline.
+_LORA_TIMEOUT = 30
+
+
+def test_router_proxy_post_takes_model_from_query_when_body_is_not_an_object():
+    global server
+    server.start()
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_id)
+
+    # Baseline: the GET side has always taken ?model=, and answers for a
+    # loaded model. If this breaks, the test below proves nothing.
+    get_res = server.make_request(
+        "GET", f"/lora-adapters?model={model_id}", timeout=_LORA_TIMEOUT
+    )
+    assert get_res.status_code == 200, \
+        "GET /lora-adapters?model= is the baseline this test is measured against"
+
+    # The defect: an array body cannot name a model, so the router rejects it.
+    unaddressed = server.make_request(
+        "POST", "/lora-adapters", data=[], timeout=_LORA_TIMEOUT
+    )
+    assert unaddressed.status_code != 200, \
+        "a POST naming no model anywhere must still be refused -- the fix adds a " \
+        "second place to look, it does not make the model optional"
+
+    # The fix: the query parameter addresses the model, the body stays the bare
+    # array the child's handler requires, and the request reaches it.
+    res = server.make_request(
+        "POST", f"/lora-adapters?model={model_id}", data=[], timeout=_LORA_TIMEOUT
+    )
+    assert res.status_code == 200, \
+        f"proxy_post should fall back to ?model= for a non-object body, got {res.body}"
+
+
+def test_router_proxy_post_body_model_still_wins_over_the_query():
+    """The fallback must not change how any existing caller is routed.
+
+    Keeps the fixture's default models_max: this needs one resident model, and
+    every extra load costs real time on the CPU-only runner this suite runs on.
+    """
+    global server
+    server.start()
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_id)
+
+    # Body names a real model; the query names one that does not exist. If the
+    # query were consulted first this would 404 on the bogus name.
+    res = server.make_request(
+        "POST",
+        "/v1/chat/completions?model=no-such-model-should-be-ignored",
+        data={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        },
+        timeout=_LORA_TIMEOUT,
+    )
+    assert res.status_code == 200, \
+        f"a body-carried model must take priority over the query string, got {res.body}"

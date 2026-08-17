@@ -5,7 +5,7 @@ System management and health check endpoints.
 import json
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -110,8 +110,28 @@ def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:writ
     If all requested adapters are already preloaded, adjusts scales without restart.
     If new adapters need loading, updates the preload args and restarts.
     Pass an empty loras list to set all scales to 0.
+
+    ROUTER MODE: the hot-swap path below needs the accompanying `proxy_post`
+    patch to be reachable at all (self.llamolotl#44). The router's POST proxy
+    (`server_models_routes::proxy_post`,
+    self.llama/tools/server/server-models.cpp:2434-2450) parses the body as
+    JSON and demands a top-level `model` field, then forwards that body to the
+    child VERBATIM (`proxy_request`, :2059-2060 — no mutation). The child's own
+    handler (`post_lora_adapters`, server-context.cpp:5110-5115) rejects
+    anything that is not a JSON array. No single body satisfies both.
+    Confirmed live against gemma-4-26B on 2026-08-11:
+
+      POST []                     -> 400 at the ROUTER, "model name is missing"
+      POST {"model":…,"loras":[]} -> 400 at the CHILD,  "body must be an array"
+      POST [] + ?model=…          -> 400 at the router (proxy_post reads the
+                                     body only; the query string is ignored)
+
+    Before that was understood, this endpoint reported `"method": "restart"`
+    while looking like it had merely chosen to — every apply took the restart
+    path, always, because the adapter read above it silently returned [].
     """
     import urllib.request
+    from urllib.parse import quote
 
     # Validate all requested LoRA files exist
     for lora in req.loras:
@@ -122,8 +142,12 @@ def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:writ
         if not lora_path.exists():
             raise HTTPException(status_code=404, detail=f"LoRA file not found: {lora_file}")
 
+    # Which model these adapters belong to. Adapters are per-child state in
+    # router mode, so this is not optional context -- it is the address.
+    target_model = req.model or _primary_loaded_model()
+
     # Check which adapters are currently loaded in llama-server
-    loaded_adapters = _get_active_loras_from_server()
+    loaded_adapters = _get_active_loras_from_server(target_model)
     loaded_paths = {a.get("path", ""): a.get("id") for a in loaded_adapters}
 
     # Check if all requested adapters are already loaded
@@ -145,8 +169,16 @@ def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:writ
 
         try:
             payload = json.dumps(scale_updates).encode()
+            # The body stays a bare array, which is what the CHILD requires and
+            # what the router forwards unmodified. The model rides in the query
+            # string -- inert against today's proxy_post, read by the patched
+            # one. Sending it now means the hot-swap path needs no second edit
+            # when that lands.
+            url = "http://localhost:8080/lora-adapters"
+            if target_model:
+                url += f"?model={quote(target_model, safe='')}"
             api_req = urllib.request.Request(
-                "http://localhost:8080/lora-adapters",
+                url,
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -156,11 +188,14 @@ def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:writ
             return {
                 "status": "applied",
                 "method": "hot-swap",
+                "model": target_model,
                 "loras": req.loras,
                 "restart": False,
             }
         except Exception as e:
-            log.warning("Hot-swap failed, falling back to restart: %s", e)
+            log.warning(
+                "Hot-swap failed for model %r, falling back to restart: %s", target_model, e
+            )
 
     # Cold path: update args file with --lora-init-without-apply and restart
     args_parts = []
@@ -185,10 +220,24 @@ def apply_loras(req: ApplyLorasRequest, _auth=Depends(require_scope("system:writ
 
 
 @router.get("/api/system/active-loras")
-def get_active_loras(_auth=Depends(require_scope("system:read"))):
-    """Return currently active LoRA adapters from llama-server's native API."""
+def get_active_loras(
+    model: Optional[str] = None, _auth=Depends(require_scope("system:read"))
+):
+    """Return currently active LoRA adapters from llama-server's native API.
+
+    `model` names which resident model to ask about; omitted, it resolves to
+    the primary loaded model. Adapters are per-child state in router mode, so
+    there is no server-wide answer (self.llamolotl#44).
+
+    Until #44 this route always reported `source: "args-file"` while claiming
+    to prefer live state: the native read 400'd on every call for want of a
+    model name and the error was swallowed into an empty list, which reads
+    here as "no adapters" and falls through. The args file it parsed instead
+    describes what llama-server was LAUNCHED with, not what is loaded now --
+    the two diverge the moment anything is applied without a restart.
+    """
     # Try native API first (live state)
-    adapters = _get_active_loras_from_server()
+    adapters = _get_active_loras_from_server(model)
     if adapters:
         loras = []
         for a in adapters:
@@ -197,7 +246,7 @@ def get_active_loras(_auth=Depends(require_scope("system:read"))):
                 "file": Path(a.get("path", "")).name,
                 "scale": a.get("scale", 0.0),
             })
-        return {"loras": loras, "source": "llama-server"}
+        return {"loras": loras, "source": "llama-server", "model": model or _primary_loaded_model()}
 
     # Fallback to args file if server is not responding
     if not LLAMA_SERVER_ARGS_FILE.exists():
