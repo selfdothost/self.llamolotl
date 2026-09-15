@@ -36,9 +36,31 @@ Re-vendor history: originally pinned at 699bb0e95b1befd66c64456193a0dd958a96455e
 (added 2026-04-22). Re-vendored to e8f19cc0ad70a243c8012bf17b4be601abfc8ea2
 (2026-07-16) to pick up Gemma 4 (`gemma4`/`gemma4-iswa`) architecture support —
 see `context/kits/cavekit-llama-revendor.md` for the full process and the
-next re-vendor's runbook.
+next re-vendor's runbook. Re-vendored to
+5bda51bfbc62e64193221e639f6ad4e08767d760 (master HEAD, 2026-09-11) to pick up
+the `qwen4exp` architecture (Qwen3.8-Flash-Next, upstream #27742 plus its
+follow-up fixes through #27941) — same removals policy as before
+(`tools/server/bench/` dropped again, upstream `.gitmodules` not carried), same
+`tools/ui/` handling (vendored in full, disabled at build time).
 
-Local modifications (on top of the e8f19cc0 pin): `conversion/qwen.py`'s
+Port-forward notes for this re-vendor (what moved, where the yard patches
+landed this time): upstream refactored LRU eviction into a `server_lru_sched`
+class, so the `pin` veto (self.ai#128) now lives inside `pick_victim()` where
+it covers every caller — the old patch had the veto in `unload_lru()` and a
+preference at the VRAM-eviction site separately — plus a `count_pinned()`
+helper for the all-pinned diagnostics; upstream folded the per-model `/models`
+JSON into a shared `get_res_model_info()` helper, so the measured per-device
+`memory` publication (#35/#36) now rides both `/models` and `/v1/models`;
+upstream grew its own `--dedup-cache-models` preset flag and a commented-out
+`pin` sketch, which coexist with the yard flags (the sketch superseded by the
+implemented yard `pin`); upstream's
+`tools/server/tests/unit/test_router.py` and yard's had diverged from a common
+base, and are merged into one file (upstream's queue/dedup tests plus all yard
+VRAM/footprint/shed/pin tests); `common/fit.cpp`'s yard `ngl_ceiling`
+(ceiling-not-pin) delta re-applied on top of upstream's own fit evolution.
+
+Local modifications (on top of the 5bda51bf pin; the same set as the e8f19cc0
+pin, re-ported): `conversion/qwen.py`'s
 `_LinearAttentionVReorderBase._reorder_v_heads` is patched to duck-type LoRA
 tensors (checks for a `get_lora_A_B` method and recurses into the correct
 A/B component instead of calling `.reshape()`/`.permute()` directly on a
