@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1.5
+# Vulkan flavor of the yard llamolotl image — argornath Polaris lane (#56).
+#
+# NO CUDA: serves AMD GPUs through Mesa/RADV (verified on argornath's
+# RX 580 2048SP, gfx803, Vulkan 1.4.335 / Mesa 26.0.8 — rx580-tts bench
+# 2026-10-07). Builds the fork's llama-server (router mode, preset ini,
+# control plane) AND llama-tts (TTS lane, with the yard streaming/worker
+# patch from patches/).
+#
+# TARGET CPU ISA: the lane node is a Xeon W3530 (Lynnfield, 2009) — SSE4.2,
+# NO AVX. Two hard lessons baked into the flags below (both verified live):
+#   1. GGML_CPU_MARCH=x86-64-v2 alone is IGNORED while GGML_NATIVE is ON
+#      (default) — the configure banner still says "-march=native".
+#   2. Even with GGML_NATIVE=OFF, the march string alone expands to
+#      "-msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2" — SIGILL class on the
+#      W3530. The per-feature OFF toggles are what actually make this binary
+#      safe. (This supersedes the bare GGML_CPU_MARCH recipe from !62.)
+# Base is ubuntu:26.04 to exactly match the package set the bench verified
+# (glslc as its own package; spirv-headers + spirv-tools-headers names).
+
+ARG UBUNTU_VERSION=26.04
+
+FROM ubuntu:${UBUNTU_VERSION} AS build
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake patch \
+        libvulkan-dev glslc glslang-tools spirv-headers spirv-tools-headers \
+        libssl-dev libgomp1 libcurl4-openssl-dev ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /llama-src
+COPY self.llama/ .
+
+# yard patch: llama-tts streaming emission + resident stdio worker
+# (tools/tts + tools/mtmd). Generated against upstream bd4eeaa; applies to
+# the vendored tree with small offsets (verified).
+COPY patches/0001-tts-streaming-worker.patch /tmp/
+RUN patch -p1 < /tmp/0001-tts-streaming-worker.patch
+
+RUN cmake -B build \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CPU_MARCH=x86-64-v2 \
+      -DGGML_F16C=OFF \
+      -DGGML_FMA=OFF \
+      -DGGML_AVX=OFF \
+      -DGGML_AVX2=OFF \
+      -DGGML_BMI2=OFF \
+      -DGGML_VULKAN=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DCMAKE_BUILD_TYPE=Release \
+      . && \
+    cmake --build build --config Release -j$(nproc) --target llama-server llama-tts llama-bench
+
+RUN mkdir -p /app/lib && \
+    cp build/bin/llama-server /app/llama-server && \
+    cp build/bin/llama-tts    /app/llama-tts && \
+    cp build/bin/llama-bench  /app/llama-bench && \
+    cp -P build/bin/*.so* /app/lib/
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+# Runtime: vulkan loader + Mesa RADV ICD (the device itself comes from the
+# host via /dev/dri + supplementalGroups; no nvidia-style runtime injection
+# exists for AMD — the container must carry its own ICD). python3 rides
+# along for thin adapters (e.g. the self.ai TTS HTTP wrapper) so the TTS
+# Deployment can run a ConfigMap script against this image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libvulkan1 mesa-vulkan-drivers vulkan-tools \
+        libgomp1 libssl3 libcurl4 ca-certificates python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app/llama-server /app/llama-server
+COPY --from=build /app/llama-tts /app/llama-tts
+COPY --from=build /app/llama-bench /app/llama-bench
+COPY --from=build /app/lib /app/lib
+
+ENV LD_LIBRARY_PATH=/app/lib
+WORKDIR /app
+
+# GPU engagement proof at deploy time: `vulkaninfo --summary` in the pod.
+# The fork's static vulkan build logs NO backend lines — verify with
+# /sys/class/drm/card*/device/mem_info_vram_used deltas, not log greps.
+CMD ["/app/llama-server", "--help"]

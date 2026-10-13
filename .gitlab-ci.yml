@@ -177,6 +177,38 @@ build:llama-server:
       --export-cache "type=registry,ref=${IMAGE}/cache-llama-only,mode=max"
       --output "$OUT"
 
+# --- vulkan flavor (argornath Polaris lane, #56): llama-server (fork router)
+# + llama-tts (yard streaming/worker patch) built GGML_VULKAN=ON, no CUDA,
+# x86-64-v2-safe flags for the W3530 target — see Dockerfile.vulkan header
+# for the ISA lessons. Consumes self.llama/ AND patches/ (the tts patch is
+# applied in-image), so both are in the changes guard. ---
+build:vulkan:
+  stage: build
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 2h
+  resource_group: buildkit   # see .buildkit-before note (#41)
+  before_script: *buildkit-before
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - self.llama/**/*
+        - patches/0001-tts-streaming-worker.patch
+        - Dockerfile.vulkan
+        - .gitlab-ci.yml
+  script:
+    - export TAGS="${IMAGE}:vulkan-${CI_COMMIT_SHORT_SHA},${IMAGE}:vulkan-latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --opt filename=Dockerfile.vulkan
+      --import-cache "type=registry,ref=${IMAGE}/cache-vulkan"
+      --export-cache "type=registry,ref=${IMAGE}/cache-vulkan,mode=max"
+      --output "$OUT"
+
+
 # --- test: real pytest server suite against the just-built llama-server ----
 # Runs inside the llama-only image build:llama-server just published (needs:
 # pins it to that job's output, same $CI_COMMIT_SHORT_SHA tag) -- reuses the
@@ -622,4 +654,28 @@ publish:training:
       --local dockerfile="$CI_PROJECT_DIR"
       --import-cache "type=registry,ref=${IMAGE}/cache-training"
       --export-cache "type=registry,ref=${IMAGE}/cache-training,mode=max"
+      --output "$OUT"
+
+# --- publish:vulkan — main-only canonical tags for the Polaris lane image.
+# Same shape as publish:llama-server: no changes guard on main (a guard there
+# could let a push to main publish nothing at all). ---
+publish:vulkan:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 2h
+  resource_group: buildkit   # see .buildkit-before note (#41)
+  before_script: *buildkit-before
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - export TAGS="${IMAGE}:vulkan-${CI_COMMIT_SHORT_SHA},${IMAGE}:vulkan-latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR"
+      --opt filename=Dockerfile.vulkan
+      --import-cache "type=registry,ref=${IMAGE}/cache-vulkan"
+      --export-cache "type=registry,ref=${IMAGE}/cache-vulkan,mode=max"
       --output "$OUT"

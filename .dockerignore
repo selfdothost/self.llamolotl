@@ -1,7 +1,8 @@
 self.llama/build/
 self.llama/.git/
 self.axolotl/
-patches/
+patches/*
+!patches/0001-tts-streaming-worker.patch
 Dockerfile
 Dockerfile.*
 .dockerignore

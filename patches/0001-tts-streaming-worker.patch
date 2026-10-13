@@ -1,0 +1,644 @@
+diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
+index 5fb7ea9a0..d9fa06abf 100644
+--- a/tools/mtmd/mtmd-helper-gen.cpp
++++ b/tools/mtmd/mtmd-helper-gen.cpp
+@@ -92,6 +92,8 @@ public:
+     // set out_stop on end-of-speech, h_state_out must be null if no frame is generated
+     virtual int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) = 0;
+     virtual int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
++    // non-flushing variant of get_output, for streaming pollers
++    virtual int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
+ 
+ protected:
+     llama_context * lctx;
+@@ -209,6 +211,10 @@ public:
+         seed  = inp->seed;
+         out_type = inp->out_type;
+ 
++        if (inp->wav_window_frames > 0) {
++            window_frames = (size_t) inp->wav_window_frames;
++        }
++
+         // the prompt above holds the whole text stream up to tts_eos, so every generated
+         // frame adds tts_pad on top of the codes embedding
+         overlay = row(tts_pad);
+@@ -326,6 +332,31 @@ public:
+         return 0;
+     }
+ 
++    // like get_output, but does NOT flush pending codes/feats: returns only
++    // what has already been decoded. lets a streaming caller poll without
++    // breaking the vocoder's own window cadence.
++    int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) {
++        *out_sample_rate = info.sample_rate;
++        if (out_n_samples) {
++            *out_n_samples = (int64_t) audio_pcm.size();
++        }
++
++        if (out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM) {
++            *out_data     = (const char *) audio_pcm.data();
++            *out_data_len = audio_pcm.size() * sizeof(float);
++            return 0;
++        }
++
++        out_buf.clear();
++        if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
++            LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
++            return 1;
++        }
++        *out_data     = out_buf.data();
++        *out_data_len = out_buf.size();
++        return 0;
++    }
++
+ private:
+     bool ensure_cache() {
+         if (specials_ok) {
+@@ -687,6 +718,29 @@ public:
+         return 0;
+     }
+ 
++    // like get_output, but does NOT flush pending feats
++    int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) override {
++        *out_sample_rate = info.sample_rate;
++        if (out_n_samples) {
++            *out_n_samples = (int64_t) audio_pcm.size();
++        }
++
++        if (out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM) {
++            *out_data     = (const char *) audio_pcm.data();
++            *out_data_len = audio_pcm.size() * sizeof(float);
++            return 0;
++        }
++
++        out_buf.clear();
++        if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
++            LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
++            return 1;
++        }
++        *out_data     = out_buf.data();
++        *out_data_len = out_buf.size();
++        return 0;
++    }
++
+ private:
+     bool ensure_cache() {
+         if (specials_ok) {
+@@ -1058,3 +1112,11 @@ int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t *
+     }
+     return ctx->pipeline->get_output(out_sample_rate, out_data, out_data_len, out_n_samples);
+ }
++
++int32_t mtmd_helper_gen_audio_peek_output(mtmd_helper_gen_audio * ctx, int32_t * out_sample_rate,
++                                          const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) {
++    if (!ctx->pipeline) {
++        return 1;
++    }
++    return ctx->pipeline->peek_output(out_sample_rate, out_data, out_data_len, out_n_samples);
++}
+diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
+index 7436230f0..0a838d001 100644
+--- a/tools/mtmd/mtmd-helper.h
++++ b/tools/mtmd/mtmd-helper.h
+@@ -217,6 +217,12 @@ struct mtmd_helper_gen_audio_inp {
+     uint32_t seed; // UINT32_MAX for random (default: random)
+ 
+     enum mtmd_helper_gen_audio_outtype out_type;
++
++    // optional override for the code->wav decode window (frames per flush).
++    // 0 = model default (aligned with the vocoder's attention window).
++    // smaller values trade vocoder boundary quality for lower streaming latency.
++    // currently honored by the qwen3-tts pipeline only.
++    int32_t  wav_window_frames;
+ };
+ 
+ MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
+@@ -257,6 +263,16 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
+                         size_t * out_data_len,
+                         int64_t * out_n_samples);
+ 
++// non-flushing variant of the above: returns only audio that has already been
++// decoded, without forcing the vocoder to decode a partial window. intended
++// for streaming pollers that must not disturb the window cadence.
++MTMD_API int32_t mtmd_helper_gen_audio_peek_output(
++                        mtmd_helper_gen_audio * ctx,
++                        int32_t * out_sample_rate,
++                        const char ** out_data,
++                        size_t * out_data_len,
++                        int64_t * out_n_samples);
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+@@ -300,6 +316,9 @@ struct gen_audio {
+     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
+         return mtmd_helper_gen_audio_get_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
+     }
++    int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
++        return mtmd_helper_gen_audio_peek_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
++    }
+ };
+ 
+ } // namespace mtmd_helper
+diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
+index 6fd193632..748e21b6b 100644
+--- a/tools/tts/tts.cpp
++++ b/tools/tts/tts.cpp
+@@ -6,14 +6,37 @@
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ 
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <functional>
++#include <iostream>
++#include <memory>
+ #include <string>
++#include <vector>
+ 
+ /**
+  * Please note that this is NOT a production-ready binary.
+  * It is a playground for trying TTS support in llama.cpp.
+  * For contributors: please keep this code simple and easy to understand. Do not add unnecessary complexity. The goal is to have a simple CLI for testing TTS support.
++ *
++ * Two extensions beyond stock behavior:
++ *  - "-o -" streams the WAV to stdout as it is generated: header first
++ *    (chunk sizes set to 0xFFFFFFFF, see note in write_wav_header_stream),
++ *    then int16 PCM in generation order.
++ *  - --tts-worker keeps the model resident and serves one JSON request per
++ *    stdin line, answering with JSON events on stdout (logs stay on stderr):
++ *      in : {"text":"...","speaker":"/path.wav","lang":"en",
++ *            "n_predict":512,"window":24,"stream":true,"seed":42}
++ *      out: {"ev":"ready","sample_rate":24000}
++ *           {"ev":"chunk","samples":1200,"pcm":"<base64, int16le mono>"}
++ *           {"ev":"done","frames":97,"samples":111360,"duration_s":9.28,...}
++ *           {"ev":"error","msg":"..."}
++ *    streamed chunks carry raw int16 PCM; a non-stream request answers with
++ *    a single chunk carrying a complete WAV file.
+  */
+ 
+ struct tts_timings {
+@@ -32,80 +55,89 @@ struct tts_timings {
+     }
+ };
+ 
++struct tts_request {
++    std::string text;
++    std::string speaker_path;
++    std::string lang;
++    int32_t     n_predict = 0;  // 0 = default (512)
++    int32_t     window    = 0;  // 0 = model default vocoder window
++    uint32_t    seed      = UINT32_MAX;
++    bool        stream    = false;
++};
++
++struct tts_stats {
++    int     frames      = 0;
++    int64_t samples     = 0;
++    int32_t sample_rate = 0;
++    double  t_prompt_s  = 0.0;
++    double  t_gen_s     = 0.0;
++    double  t_wav_s     = 0.0;
++};
++
++static inline int16_t float_to_i16(float v) {
++    v = std::max(-1.0f, std::min(1.0f, v));
++    return (int16_t) (v * 32767.0f);
++}
++
++static std::string base64_encode(const void * p, size_t n) {
++    static const char * tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    const unsigned char * src = (const unsigned char *) p;
++    std::string out;
++    out.reserve((n + 2) / 3 * 4 + 1);
++    for (size_t i = 0; i < n; i += 3) {
++        const uint32_t v = (uint32_t) src[i] << 16 |
++                           (i + 1 < n ? (uint32_t) src[i + 1] << 8 : 0) |
++                           (i + 2 < n ? (uint32_t) src[i + 2] : 0);
++        out += tbl[(v >> 18) & 63];
++        out += tbl[(v >> 12) & 63];
++        out += (i + 1 < n) ? tbl[(v >> 6) & 63] : '=';
++        out += (i + 2 < n) ? tbl[v & 63] : '=';
++    }
++    return out;
++}
++
++// streaming WAV header: total sizes are unknown up front, so both 32-bit
++// chunk sizes are set to the maximum. Streaming readers (and most players)
++// accept this; a receiver that needs a well-formed file can patch the header
++// once it knows the total length.
++static void write_wav_header_stream(FILE * f, int32_t rate) {
++    const uint32_t max    = 0xFFFFFFFFu;
++    const uint32_t fmt_sz = 16, byte_rate = (uint32_t) rate * 2, rate32 = (uint32_t) rate;
++    const uint16_t fmt = 1, ch = 1, align = 2, bits = 16;
++    auto w = [&](const void * p, size_t n) { fwrite(p, 1, n, f); };
++    w("RIFF", 4); w(&max, 4); w("WAVE", 4);
++    w("fmt ", 4); w(&fmt_sz, 4);
++    w(&fmt, 2); w(&ch, 2); w(&rate32, 4);
++    w(&byte_rate, 4); w(&align, 2); w(&bits, 2);
++    w("data", 4); w(&max, 4);
++}
++
+ static void print_usage(int, char ** argv) {
+     LOG("\nexample usage:\n");
+     LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o output.wav", argv[0]);
+-    LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav\n", argv[0]);
+-    LOG("\nnote: --tts-lang and --tts-speaker-file may not be supported in all models");
++    LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav", argv[0]);
++    LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o - | ffplay -", argv[0]);
++    LOG("\n    %s -m backbone.gguf -mm mmproj.gguf --tts-worker < requests.jsonl", argv[0]);
++    LOG("\n\nnote: --tts-lang and --tts-speaker-file may not be supported in all models");
+     LOG("\n      use -n to limit the output length");
+     LOG("\n      see tts/README.md for per-model usage notes");
+     LOG("\n\n");
+ }
+ 
+-int main(int argc, char ** argv) {
+-    common_params params;
+-
+-    common_init();
+-
+-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
+-        return 1;
+-    }
+-
+-    mtmd_helper_log_set(common_log_default_callback, nullptr);
+-
+-    if (params.prompt.empty()) {
+-        LOG_ERR("no prompt provided, use -p \"text\"\n");
+-        return 1;
+-    }
+-    if (params.mmproj.path.empty()) {
+-        LOG_ERR("no mmproj provided, use --mmproj\n");
+-        return 1;
+-    }
+-
+-    // important: keep this file as generic as possible
+-    //            model-specific logic should be in mtmd-helper-gen or mtmd API
+-
+-    // always enable embd, so that we can pass hidden states to the audio generation helper
+-    params.embedding = true;
+-
+-    llama_backend_init();
+-    llama_numa_init(params.numa);
+-
+-    //
+-    // load backbone model and mmproj
+-    //
+-
+-    auto llama_init = common_init_from_params(params);
+-    llama_model    * model = llama_init->model();
+-    llama_context  * lctx  = llama_init->context();
+-    common_sampler * smpl  = llama_init->sampler(0);
+-    if (!model || !lctx) {
+-        LOG_ERR("failed to init model/context\n");
+-        return 1;
+-    }
+-
+-    mtmd_context_params mtmd_params = mtmd_context_params_default();
+-    mtmd_params.use_gpu = params.mmproj_use_gpu;
+-    mtmd_params.device  = params.mmproj_device;
+-    mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
+-    if (!mctx) {
+-        LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
+-        return 1;
+-    }
+-    if (mtmd_gen_audio_get_info(mctx.get()).type == MTMD_GEN_AUDIO_TYPE_NONE) {
+-        LOG_ERR("mmproj does not support audio generation\n");
+-        return 1;
+-    }
+-
+-    //
+-    // stage 0: process speaker reference file, if any
+-    //
+-
++// one synthesis run against an already-loaded model.
++//
++// streaming requests get incremental int16 PCM through emit() as the vocoder
++// flushes windows; the final drain happens before returning.
++// non-streaming requests emit exactly once, with the complete WAV file.
++static int run_tts_request(common_params & params, llama_context * lctx, mtmd::context_ptr & mctx,
++                           common_sampler * smpl, const tts_request & req,
++                           const std::function<void(const void * data, size_t len, bool is_pcm16)> & emit,
++                           tts_stats & stats) {
+     mtmd::bitmap_ptr speaker_bitmap;
+-    if (!params.tts_speaker_file.empty()) {
+-        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
++    if (!req.speaker_path.empty()) {
++        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), req.speaker_path.c_str(), false, mtmd_helper_init_opt_default());
+         if (!wrapper.bitmap) {
+-            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
++            LOG_ERR("failed to load speaker file %s\n", req.speaker_path.c_str());
+             return 1;
+         }
+         speaker_bitmap.reset(wrapper.bitmap);
+@@ -114,18 +146,16 @@ int main(int argc, char ** argv) {
+     mtmd_helper::gen_audio gen(lctx, mctx.get());
+     mtmd_helper_gen_audio_inp inp{};
+     inp.seq_id      = 0;
+-    inp.prompt      = params.prompt.c_str();
+-    inp.prompt_len  = params.prompt.size();
++    inp.prompt      = req.text.c_str();
++    inp.prompt_len  = req.text.size();
+     inp.speaker_ref = speaker_bitmap.get();
+-    inp.lang        = params.tts_lang.c_str();
++    inp.lang        = req.lang.c_str();
+     inp.top_k       = params.sampling.top_k;
+     inp.top_p       = params.sampling.top_p;
+-    inp.seed        = params.sampling.seed;
+-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+-
+-    //
+-    // stage 1: process prompt via backbone model, generate semantic representation
+-    //
++    inp.seed        = req.seed;
++    inp.out_type    = req.stream ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
++                                 : MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
++    inp.wav_window_frames = req.window;
+ 
+     if (gen.set_input(&inp) != 0) {
+         LOG_ERR("set_input failed\n");
+@@ -152,7 +182,7 @@ int main(int argc, char ** argv) {
+         return t;
+     };
+ 
+-    const int max_new = params.n_predict > 0 ? params.n_predict : 512;
++    const int max_new = req.n_predict > 0 ? req.n_predict : (params.n_predict > 0 ? params.n_predict : 512);
+     int n_frames = 0;
+     llama_token sampled = sample_semantic_code();
+     const float * h_state = llama_get_embeddings_ith(lctx, -1);
+@@ -160,6 +190,31 @@ int main(int argc, char ** argv) {
+     tts_timings timings;
+     const int64_t t_gen_start_us = ggml_time_us();
+ 
++    // streaming: pull whatever PCM the helper has already decoded (peek does
++    // NOT force a partial vocode, the window cadence stays intact) and hand
++    // out only the part past the last emission
++    size_t watermark = 0;
++    auto poll_audio = [&]() -> bool {
++        int32_t      rate = 0;
++        const char * data = nullptr;
++        size_t       len  = 0;
++        int64_t      n_samples = 0;
++        if (gen.peek_output(&rate, &data, &len, &n_samples) != 0) {
++            LOG_ERR("peek_output failed mid-generation\n");
++            return false;
++        }
++        if (n_samples > (int64_t) watermark) {
++            const float * pcm = (const float *) data;
++            std::vector<int16_t> chunk(n_samples - (int64_t) watermark);
++            for (size_t i = 0; i < chunk.size(); i++) {
++                chunk[i] = float_to_i16(pcm[watermark + i]);
++            }
++            emit(chunk.data(), chunk.size() * sizeof(int16_t), true);
++            watermark = (size_t) n_samples;
++        }
++        return true;
++    };
++
+     bool stop = false;
+     while (!stop && n_frames < max_new) {
+         const float * h_next = nullptr;
+@@ -178,6 +233,10 @@ int main(int argc, char ** argv) {
+         h_state = h_next;
+         sampled = sample_semantic_code();
+         timings.report(n_frames);
++
++        if (req.stream && !poll_audio()) {
++            return 1;
++        }
+     }
+     const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
+ 
+@@ -194,21 +253,214 @@ int main(int argc, char ** argv) {
+ 
+     LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
+ 
+-    const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
+-    const double t_total_s  = t_prompt_s + t_gen_s + t_wav_s;
+-    const double audio_s    = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
+-    LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
+-            t_prompt_s, t_gen_s, t_wav_s, t_total_s);
+-    LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
+-    FILE * f = fopen(params.out_file.c_str(), "wb");
+-    if (!f) {
+-        LOG_ERR("failed to open %s\n", params.out_file.c_str());
++    if (req.stream) {
++        if (!poll_audio()) { // drains whatever the final flush produced
++            return 1;
++        }
++    } else {
++        emit(data, data_len, false);
++    }
++
++    stats.frames      = n_frames;
++    stats.samples     = n_samples;
++    stats.sample_rate = sample_rate;
++    stats.t_prompt_s  = (t_gen_start_us - t_prompt_start_us) / 1e6;
++    stats.t_gen_s     = t_gen_s;
++    stats.t_wav_s     = t_wav_s;
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++
++    common_init();
++
++    // extensions are pre-scanned and stripped so the common parser stays untouched
++    bool worker_mode = false;
++    int32_t window_override = 0;
++    std::vector<char *> args = {argv[0]};
++    for (int i = 1; i < argc; i++) {
++        if (!strcmp(argv[i], "--tts-worker")) {
++            worker_mode = true;
++        } else if (!strcmp(argv[i], "--tts-window") && i + 1 < argc) {
++            window_override = atoi(argv[++i]);
++        } else {
++            args.push_back(argv[i]);
++        }
++    }
++
++    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_TTS, print_usage)) {
++        return 1;
++    }
++
++    mtmd_helper_log_set(common_log_default_callback, nullptr);
++
++    if (!worker_mode && params.prompt.empty()) {
++        LOG_ERR("no prompt provided, use -p \"text\"\n");
++        return 1;
++    }
++    if (params.mmproj.path.empty()) {
++        LOG_ERR("no mmproj provided, use --mmproj\n");
++        return 1;
++    }
++
++    // important: keep this file as generic as possible
++    //            model-specific logic should be in mtmd-helper-gen or mtmd API
++
++    // always enable embd, so that we can pass hidden states to the audio generation helper
++    params.embedding = true;
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    //
++    // load backbone model and mmproj (resident across worker requests)
++    //
++
++    auto llama_init = common_init_from_params(params);
++    llama_model    * model = llama_init->model();
++    llama_context  * lctx  = llama_init->context();
++    if (!model || !lctx) {
++        LOG_ERR("failed to init model/context\n");
+         return 1;
+     }
+-    fwrite(data, 1, data_len, f);
+-    fclose(f);
+-    LOG_INF("wrote %s\n", params.out_file.c_str());
+ 
++    mtmd_context_params mtmd_params = mtmd_context_params_default();
++    mtmd_params.use_gpu = params.mmproj_use_gpu;
++    mtmd_params.device  = params.mmproj_device;
++    mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
++    if (!mctx) {
++        LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
++        return 1;
++    }
++    if (mtmd_gen_audio_get_info(mctx.get()).type == MTMD_GEN_AUDIO_TYPE_NONE) {
++        LOG_ERR("mmproj does not support audio generation\n");
++        return 1;
++    }
++    const int32_t sample_rate = mtmd_gen_audio_get_info(mctx.get()).sample_rate;
++
++    if (worker_mode) {
++        printf("{\"ev\":\"ready\",\"sample_rate\":%d}\n", sample_rate);
++        fflush(stdout);
++
++        // resident worker: one JSON request per stdin line, JSON events on stdout
++        std::string line;
++        while (std::getline(std::cin, line)) {
++            if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
++                continue;
++            }
++            tts_request req;
++            try {
++                auto j = nlohmann::json::parse(line);
++                req.text         = j.at("text").get<std::string>();
++                req.speaker_path = j.value("speaker", "");
++                req.lang         = j.value("lang", params.tts_lang);
++                req.n_predict    = j.value("n_predict", 0);
++                req.window       = j.value("window", window_override);
++                req.seed         = j.value("seed", UINT32_MAX);
++                req.stream       = j.value("stream", false);
++            } catch (const std::exception & e) {
++                printf("{\"ev\":\"error\",\"msg\":\"bad request: %s\"}\n", e.what());
++                fflush(stdout);
++                continue;
++            }
++
++            // per-request sampler (honors the request seed) and clean KV
++            params.sampling.seed = req.seed;
++            common_sampler * smpl = common_sampler_init(model, params.sampling);
++            llama_memory_seq_rm(llama_get_memory(lctx), 0, 0, -1);
++
++            std::string buffered;
++            tts_stats stats;
++            const int64_t t_req_start_us = ggml_time_us();
++
++            const int rc = run_tts_request(params, lctx, mctx, smpl, req,
++                [&](const void * data, size_t len, bool is_pcm16) {
++                    if (req.stream) {
++                        printf("{\"ev\":\"chunk\",\"pcm16\":%s,\"samples\":%zu,\"pcm\":\"%s\"}\n",
++                               is_pcm16 ? "true" : "false",
++                               len / sizeof(int16_t),
++                               base64_encode(data, len).c_str());
++                        fflush(stdout);
++                    } else if (len > 0) {
++                        buffered.assign((const char *) data, len);
++                    }
++                }, stats);
++            common_sampler_free(smpl);
++
++            const double t_req_s = (ggml_time_us() - t_req_start_us) / 1e6;
++            if (rc != 0) {
++                printf("{\"ev\":\"error\",\"msg\":\"synthesis failed, see worker log\"}\n");
++                fflush(stdout);
++                continue;
++            }
++            if (!req.stream) {
++                printf("{\"ev\":\"chunk\",\"pcm16\":false,\"samples\":%zu,\"pcm\":\"%s\"}\n",
++                       buffered.size() / 2, base64_encode(buffered.data(), buffered.size()).c_str());
++                fflush(stdout);
++            }
++            printf("{\"ev\":\"done\",\"sample_rate\":%d,\"frames\":%d,\"samples\":%lld,"
++                   "\"duration_s\":%.2f,\"t_prompt_s\":%.2f,\"t_gen_s\":%.2f,\"t_wav_s\":%.2f,\"t_req_s\":%.2f}\n",
++                   sample_rate, stats.frames, (long long) stats.samples,
++                   sample_rate > 0 ? (double) stats.samples / sample_rate : 0.0,
++                   stats.t_prompt_s, stats.t_gen_s, stats.t_wav_s, t_req_s);
++            fflush(stdout);
++        }
++        llama_backend_free();
++        return 0;
++    }
++
++    //
++    // one-shot mode
++    //
++
++    const bool stream_to_stdout = params.out_file == "-";
++
++    tts_request req;
++    req.text         = params.prompt;
++    req.speaker_path = params.tts_speaker_file;
++    req.lang         = params.tts_lang;
++    req.n_predict    = params.n_predict;
++    req.window       = window_override;
++    req.seed         = params.sampling.seed;
++    req.stream       = stream_to_stdout;
++
++    FILE * out = stdout;
++    if (!stream_to_stdout) {
++        out = fopen(params.out_file.c_str(), "wb");
++        if (!out) {
++            LOG_ERR("failed to open %s\n", params.out_file.c_str());
++            return 1;
++        }
++    } else {
++        write_wav_header_stream(out, sample_rate);
++        fflush(out);
++    }
++
++    common_sampler * smpl = llama_init->sampler(0);
++
++    tts_stats stats;
++    const int rc = run_tts_request(params, lctx, mctx, smpl, req,
++        [&](const void * data, size_t len, bool is_pcm16) {
++            if (len > 0) {
++                fwrite(data, 1, len, out);
++                if (stream_to_stdout) {
++                    fflush(out);
++                }
++            }
++        }, stats);
++
++    if (rc == 0) {
++        if (stream_to_stdout) {
++            LOG_INF("streamed %d frames, %lld samples to stdout\n", stats.frames, (long long) stats.samples);
++        } else {
++            LOG_INF("wrote %s\n", params.out_file.c_str());
++        }
++    }
++
++    if (!stream_to_stdout) {
++        fclose(out);
++    }
+     llama_backend_free();
+-    return 0;
++    return rc;
+ }
