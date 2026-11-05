@@ -192,6 +192,7 @@ build:vulkan:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - self.llama/**/*
+        - self.whisper/**/*
         - patches/0001-tts-streaming-worker.patch
         - Dockerfile.vulkan
         - .gitlab-ci.yml

@@ -1,5 +1,5 @@
 diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
-index 5fb7ea9a0..d9fa06abf 100644
+index 1c58d3a..3fe7178 100644
 --- a/tools/mtmd/mtmd-helper-gen.cpp
 +++ b/tools/mtmd/mtmd-helper-gen.cpp
 @@ -92,6 +92,8 @@ public:
@@ -11,7 +11,28 @@ index 5fb7ea9a0..d9fa06abf 100644
  
  protected:
      llama_context * lctx;
-@@ -209,6 +211,10 @@ public:
+@@ -132,7 +134,19 @@ public:
+         }
+ 
+         const std::string lang   = tts_resolve_lang((inp->lang && inp->lang[0]) ? inp->lang : "english");
+-        const llama_token c_lang = find_special_token(vocab, ("<|codec_language_" + lang + "|>").c_str());
++        // 2026-10-27: find_special_token is a LINEAR vocab scan (~152k tokens
++        // for Qwen3-TTS, measured ~1.4s per request on the lane's W3530) and
++        // this was the only uncached call on the hot path. Languages are a
++        // handful of strings; cache the token per language forever.
++        static std::unordered_map<std::string, llama_token> s_lang_tok;
++        llama_token c_lang;
++        auto lang_it = s_lang_tok.find(lang);
++        if (lang_it != s_lang_tok.end()) {
++            c_lang = lang_it->second;
++        } else {
++            c_lang = find_special_token(vocab, ("<|codec_language_" + lang + "|>").c_str());
++            s_lang_tok[lang] = c_lang;
++        }
+         if (c_lang == LLAMA_TOKEN_NULL) {
+             LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
+             return 1;
+@@ -209,6 +223,10 @@ public:
          seed  = inp->seed;
          out_type = inp->out_type;
  
@@ -22,7 +43,7 @@ index 5fb7ea9a0..d9fa06abf 100644
          // the prompt above holds the whole text stream up to tts_eos, so every generated
          // frame adds tts_pad on top of the codes embedding
          overlay = row(tts_pad);
-@@ -326,6 +332,31 @@ public:
+@@ -327,6 +345,31 @@ public:
          return 0;
      }
  
@@ -54,7 +75,37 @@ index 5fb7ea9a0..d9fa06abf 100644
  private:
      bool ensure_cache() {
          if (specials_ok) {
-@@ -687,6 +718,29 @@ public:
+@@ -366,6 +409,19 @@ private:
+ 
+     // runs the reference wav through the speaker encoder, returns one x-vector embedding row
+     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
++        // 2026-10-27: this forward measured ~1.7s per request on the RX 580
++        // lane and ran on EVERY synthesis. Keyed by bitmap POINTER: the tts
++        // worker caches bitmaps by (path, mtime, size), so a stable pointer
++        // implies stable content; a changed voice file yields a new bitmap
++        // (new pointer) and therefore a fresh entry here.
++        static std::unordered_map<const void *, std::vector<float>> s_embd_cache;
++        auto hit = s_embd_cache.find(bitmap);
++        if (hit != s_embd_cache.end()) {
++            LOG_INF("spk-embd cache HIT (%zu floats)\n", hit->second.size());
++            out = hit->second;
++            return true;
++        }
++        LOG_INF("spk-embd cache MISS — running speaker forward\n");
+         if (!mtmd_support_audio(mctx)) {
+             LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
+             return false;
+@@ -394,6 +450,9 @@ private:
+             }
+         }
+         mtmd_input_chunks_free(chunks);
++        if (ok) {
++            s_embd_cache[bitmap] = out;
++        }
+         return ok;
+     }
+ 
+@@ -689,6 +748,29 @@ public:
          return 0;
      }
  
@@ -84,7 +135,38 @@ index 5fb7ea9a0..d9fa06abf 100644
  private:
      bool ensure_cache() {
          if (specials_ok) {
-@@ -1058,3 +1112,11 @@ int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t *
+@@ -905,6 +987,20 @@ private:
+ 
+     // runs the reference wav through the mimi encoder, returns one row per 12.5Hz frame
+     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
++        // 2026-10-27: same story as the x-vector pipeline above — this is the
++        // mimi/12.5Hz voice encoder the Qwen3-TTS-12Hz mmproj actually
++        // instantiates (the diagnostic build proved THIS one runs), and the
++        // forward measured ~1.3-1.9s per request. Cached by bitmap pointer;
++        // the tts worker's (path, mtime, size) bitmap cache makes pointer
++        // stability imply content stability.
++        static std::unordered_map<const void *, std::vector<float>> s_embd_cache;
++        auto hit = s_embd_cache.find(bitmap);
++        if (hit != s_embd_cache.end()) {
++            LOG_INF("spk-embd(mimi) cache HIT (%zu floats)\n", hit->second.size());
++            out = hit->second;
++            return true;
++        }
++        LOG_INF("spk-embd(mimi) cache MISS — running voice forward\n");
+         if (!mtmd_support_audio(mctx)) {
+             LOG_ERR("mtmd_helper_gen_audio: mmproj has no voice encoder\n");
+             return false;
+@@ -933,6 +1029,9 @@ private:
+             }
+         }
+         mtmd_input_chunks_free(chunks);
++        if (ok) {
++            s_embd_cache[bitmap] = out;
++        }
+         return ok;
+     }
+ 
+@@ -1060,3 +1159,11 @@ int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t *
      }
      return ctx->pipeline->get_output(out_sample_rate, out_data, out_data_len, out_n_samples);
  }
@@ -97,10 +179,10 @@ index 5fb7ea9a0..d9fa06abf 100644
 +    return ctx->pipeline->peek_output(out_sample_rate, out_data, out_data_len, out_n_samples);
 +}
 diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
-index 7436230f0..0a838d001 100644
+index 10f2171..9849a7c 100644
 --- a/tools/mtmd/mtmd-helper.h
 +++ b/tools/mtmd/mtmd-helper.h
-@@ -217,6 +217,12 @@ struct mtmd_helper_gen_audio_inp {
+@@ -207,6 +207,12 @@ struct mtmd_helper_gen_audio_inp {
      uint32_t seed; // UINT32_MAX for random (default: random)
  
      enum mtmd_helper_gen_audio_outtype out_type;
@@ -113,7 +195,7 @@ index 7436230f0..0a838d001 100644
  };
  
  MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
-@@ -257,6 +263,16 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
+@@ -247,6 +253,16 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
                          size_t * out_data_len,
                          int64_t * out_n_samples);
  
@@ -130,7 +212,7 @@ index 7436230f0..0a838d001 100644
  #ifdef __cplusplus
  } // extern "C"
  #endif
-@@ -300,6 +316,9 @@ struct gen_audio {
+@@ -290,6 +306,9 @@ struct gen_audio {
      int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
          return mtmd_helper_gen_audio_get_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
      }
@@ -141,16 +223,18 @@ index 7436230f0..0a838d001 100644
  
  } // namespace mtmd_helper
 diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
-index 6fd193632..748e21b6b 100644
+index 6fd1936..0a0d1fd 100644
 --- a/tools/tts/tts.cpp
 +++ b/tools/tts/tts.cpp
-@@ -6,14 +6,37 @@
+@@ -6,14 +6,39 @@
  #include "mtmd.h"
  #include "mtmd-helper.h"
  
 +#include <nlohmann/json.hpp>
 +
 +#include <algorithm>
++#include <sys/stat.h>
++#include <unordered_map>
 +#include <cstdint>
  #include <cstdio>
  #include <cstring>
@@ -182,7 +266,7 @@ index 6fd193632..748e21b6b 100644
   */
  
  struct tts_timings {
-@@ -32,80 +55,89 @@ struct tts_timings {
+@@ -32,105 +57,149 @@ struct tts_timings {
      }
  };
  
@@ -264,19 +348,46 @@ index 6fd193632..748e21b6b 100644
 -
 -    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
 -        return 1;
--    }
++// one synthesis run against an already-loaded model.
++//
++// streaming requests get incremental int16 PCM through emit() as the vocoder
++// flushes windows; the final drain happens before returning.
++// non-streaming requests emit exactly once, with the complete WAV file.
++// 2026-10-27: speaker-bitmap cache. mtmd_helper_bitmap_init_from_file
++// (ref decode + spkenc encode) measured ~1.5s per request on the RX 580
++// lane and no timer covers it; voice files only change when the operator
++// swaps them, so key on path + (mtime, size) and reuse the encoded bitmap.
++static std::unordered_map<std::string, std::pair<std::pair<int64_t, int64_t>, mtmd::bitmap_ptr>> g_spk_cache;
++
++static mtmd_bitmap * acquire_speaker_bitmap(mtmd_context * mctx, const std::string & path) {
++    struct stat st {};
++    if (stat(path.c_str(), &st) != 0) {
++        return nullptr;
+     }
 -
 -    mtmd_helper_log_set(common_log_default_callback, nullptr);
 -
 -    if (params.prompt.empty()) {
 -        LOG_ERR("no prompt provided, use -p \"text\"\n");
 -        return 1;
--    }
++    const auto stamp = std::make_pair((int64_t) st.st_mtime, (int64_t) st.st_size);
++    auto it = g_spk_cache.find(path);
++    if (it != g_spk_cache.end() && it->second.first == stamp) {
++        LOG_INF("spk-bitmap cache HIT %s\n", path.c_str());
++        return it->second.second.get();
+     }
 -    if (params.mmproj.path.empty()) {
 -        LOG_ERR("no mmproj provided, use --mmproj\n");
 -        return 1;
--    }
--
++    LOG_INF("spk-bitmap cache MISS %s (encoding)\n", path.c_str());
++    auto wrapper = mtmd_helper_bitmap_init_from_file(mctx, path.c_str(), false, mtmd_helper_init_opt_default());
++    if (!wrapper.bitmap) {
++        return nullptr;
+     }
++    auto res = g_spk_cache.insert_or_assign(path, std::make_pair(stamp, mtmd::bitmap_ptr(wrapper.bitmap)));
++    return res.first->second.second.get();
++}
+ 
 -    // important: keep this file as generic as possible
 -    //            model-specific logic should be in mtmd-helper-gen or mtmd API
 -
@@ -316,36 +427,46 @@ index 6fd193632..748e21b6b 100644
 -    // stage 0: process speaker reference file, if any
 -    //
 -
-+// one synthesis run against an already-loaded model.
-+//
-+// streaming requests get incremental int16 PCM through emit() as the vocoder
-+// flushes windows; the final drain happens before returning.
-+// non-streaming requests emit exactly once, with the complete WAV file.
+-    mtmd::bitmap_ptr speaker_bitmap;
+-    if (!params.tts_speaker_file.empty()) {
+-        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
+-        if (!wrapper.bitmap) {
+-            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
 +static int run_tts_request(common_params & params, llama_context * lctx, mtmd::context_ptr & mctx,
 +                           common_sampler * smpl, const tts_request & req,
 +                           const std::function<void(const void * data, size_t len, bool is_pcm16)> & emit,
 +                           tts_stats & stats) {
-     mtmd::bitmap_ptr speaker_bitmap;
--    if (!params.tts_speaker_file.empty()) {
--        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
++    mtmd_bitmap * speaker_ref = nullptr;
 +    if (!req.speaker_path.empty()) {
-+        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), req.speaker_path.c_str(), false, mtmd_helper_init_opt_default());
-         if (!wrapper.bitmap) {
--            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
++        speaker_ref = acquire_speaker_bitmap(mctx.get(), req.speaker_path);
++        if (!speaker_ref) {
 +            LOG_ERR("failed to load speaker file %s\n", req.speaker_path.c_str());
              return 1;
          }
-         speaker_bitmap.reset(wrapper.bitmap);
-@@ -114,18 +146,16 @@ int main(int argc, char ** argv) {
-     mtmd_helper::gen_audio gen(lctx, mctx.get());
+-        speaker_bitmap.reset(wrapper.bitmap);
+     }
+ 
+-    mtmd_helper::gen_audio gen(lctx, mctx.get());
++    // 2026-10-27: constructing gen PER REQUEST reset the pipeline's
++    // specials_ok latch, so ensure_cache() rebuilt the ~1.2 GB token
++    // embedding table on every synthesis — measured 1.42s/request, the
++    // dominant cost on the RX 580 lane. The worker is single-threaded with
++    // model-lifetime lctx/mctx, so one shared instance is safe; set_input's
++    // reset() handles per-request state.
++    static mtmd_helper::gen_audio * s_gen = nullptr;
++    if (!s_gen) {
++        s_gen = new mtmd_helper::gen_audio(lctx, mctx.get());
++    }
++    mtmd_helper::gen_audio & gen = *s_gen;
      mtmd_helper_gen_audio_inp inp{};
      inp.seq_id      = 0;
 -    inp.prompt      = params.prompt.c_str();
 -    inp.prompt_len  = params.prompt.size();
+-    inp.speaker_ref = speaker_bitmap.get();
+-    inp.lang        = params.tts_lang.c_str();
 +    inp.prompt      = req.text.c_str();
 +    inp.prompt_len  = req.text.size();
-     inp.speaker_ref = speaker_bitmap.get();
--    inp.lang        = params.tts_lang.c_str();
++    inp.speaker_ref = speaker_ref;
 +    inp.lang        = req.lang.c_str();
      inp.top_k       = params.sampling.top_k;
      inp.top_p       = params.sampling.top_p;
@@ -360,9 +481,16 @@ index 6fd193632..748e21b6b 100644
 +                                 : MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 +    inp.wav_window_frames = req.window;
  
++    const int64_t t_input_start_us = ggml_time_us();
      if (gen.set_input(&inp) != 0) {
          LOG_ERR("set_input failed\n");
-@@ -152,7 +182,7 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
++    LOG_INF("set_input took %.3fs\n", (ggml_time_us() - t_input_start_us) / 1e6);
+ 
+     const int64_t t_prompt_start_us = ggml_time_us();
+ 
+@@ -152,7 +221,7 @@ int main(int argc, char ** argv) {
          return t;
      };
  
@@ -371,7 +499,7 @@ index 6fd193632..748e21b6b 100644
      int n_frames = 0;
      llama_token sampled = sample_semantic_code();
      const float * h_state = llama_get_embeddings_ith(lctx, -1);
-@@ -160,6 +190,31 @@ int main(int argc, char ** argv) {
+@@ -160,6 +229,31 @@ int main(int argc, char ** argv) {
      tts_timings timings;
      const int64_t t_gen_start_us = ggml_time_us();
  
@@ -403,7 +531,7 @@ index 6fd193632..748e21b6b 100644
      bool stop = false;
      while (!stop && n_frames < max_new) {
          const float * h_next = nullptr;
-@@ -178,6 +233,10 @@ int main(int argc, char ** argv) {
+@@ -178,6 +272,10 @@ int main(int argc, char ** argv) {
          h_state = h_next;
          sampled = sample_semantic_code();
          timings.report(n_frames);
@@ -414,7 +542,7 @@ index 6fd193632..748e21b6b 100644
      }
      const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
  
-@@ -194,21 +253,214 @@ int main(int argc, char ** argv) {
+@@ -194,21 +292,214 @@ int main(int argc, char ** argv) {
  
      LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
  
@@ -464,9 +592,12 @@ index 6fd193632..748e21b6b 100644
 +    }
 +
 +    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_TTS, print_usage)) {
-+        return 1;
-+    }
-+
+         return 1;
+     }
+-    fwrite(data, 1, data_len, f);
+-    fclose(f);
+-    LOG_INF("wrote %s\n", params.out_file.c_str());
+ 
 +    mtmd_helper_log_set(common_log_default_callback, nullptr);
 +
 +    if (!worker_mode && params.prompt.empty()) {
@@ -496,12 +627,9 @@ index 6fd193632..748e21b6b 100644
 +    llama_context  * lctx  = llama_init->context();
 +    if (!model || !lctx) {
 +        LOG_ERR("failed to init model/context\n");
-         return 1;
-     }
--    fwrite(data, 1, data_len, f);
--    fclose(f);
--    LOG_INF("wrote %s\n", params.out_file.c_str());
- 
++        return 1;
++    }
++
 +    mtmd_context_params mtmd_params = mtmd_context_params_default();
 +    mtmd_params.use_gpu = params.mmproj_use_gpu;
 +    mtmd_params.device  = params.mmproj_device;

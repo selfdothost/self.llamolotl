@@ -52,6 +52,34 @@ RUN cmake -B build \
       . && \
     cmake --build build --config Release -j$(nproc) --target llama-server llama-tts llama-bench
 
+# whisper.cpp STT leg (2026-10-28): the 580's STT slot moves from LFM2-Audio
+# (measured RTF 5-7 on this card) to whisper-small via whisper-server —
+# encoder-heavy, exactly what old GPUs chew well. Same ISA discipline as the
+# llama build above (W3530: SSE4.2, no AVX).
+WORKDIR /whisper-src
+COPY self.whisper/ .
+RUN cmake -B build \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CPU_MARCH=x86-64-v2 \
+      -DGGML_F16C=OFF \
+      -DGGML_FMA=OFF \
+      -DGGML_AVX=OFF \
+      -DGGML_AVX2=OFF \
+      -DGGML_BMI2=OFF \
+      -DGGML_VULKAN=ON \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      . && \
+    cmake --build build --config Release -j$(nproc) --target whisper-server whisper-cli && \
+    mkdir -p /app/lib && \
+    cp build/bin/whisper-server /app/whisper-server && \
+    cp build/bin/whisper-cli    /app/whisper-cli && \
+    cp -P build/bin/*.so* /app/lib/
+
+# back to the llama build tree (the cp below uses relative paths)
+WORKDIR /llama-src
+
 RUN mkdir -p /app/lib && \
     cp build/bin/llama-server /app/llama-server && \
     cp build/bin/llama-tts    /app/llama-tts && \
@@ -74,6 +102,8 @@ RUN apt-get update && \
 COPY --from=build /app/llama-server /app/llama-server
 COPY --from=build /app/llama-tts /app/llama-tts
 COPY --from=build /app/llama-bench /app/llama-bench
+COPY --from=build /app/whisper-server /app/whisper-server
+COPY --from=build /app/whisper-cli /app/whisper-cli
 COPY --from=build /app/lib /app/lib
 
 ENV LD_LIBRARY_PATH=/app/lib
