@@ -46,28 +46,46 @@ void common_fit_print(
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
-// Per-device memory ACTUALLY ALLOCATED by an already-loaded context, in bytes.
-//
-// This is the measured sibling of common_get_device_memory_data(): that one
-// projects what a model WOULD need by loading it with no_alloc, this one asks a
-// live context what it DID take. Same numbers, same attribution logic, opposite
-// side of the load.
-//
-// Note this reports what llama.cpp allocated, NOT what the driver reports for
-// the process -- the CUDA primary context and any allocator slack are outside
-// llama.cpp's accounting and so are outside this. That is the useful split for
-// a caller deciding what it can free by unloading THIS model.
-struct common_ctx_device_memory {
-    std::string name;        // backend device name, e.g. "CUDA0"
-    std::string description; // e.g. "NVIDIA GeForce RTX 4090"
-    int64_t total   = 0;     // device capacity
-    int64_t free    = 0;     // device free memory at the time of the call
-    size_t  model   = 0;     // weights placed on this device
-    size_t  context = 0;     // KV cache and other context allocations
-    size_t  compute = 0;     // temporary compute buffers
+// one row of the memory breakdown: a device, the host or another buffer type
+struct common_memory_breakdown_row {
+    enum kind_t { DEVICE, HOST, BUFFER_TYPE };
+
+    kind_t      kind = DEVICE;
+    std::string name;        // device or buffer type name, "Host" for the host row
+    std::string description; // device description, empty otherwise
+    int64_t     total = 0;   // device memory in bytes, 0 unless kind == DEVICE
+    int64_t     free  = 0;   // free device memory in bytes, 0 unless kind == DEVICE
+    size_t      model   = 0; // bytes held by this context, by kind of buffer
+    size_t      context = 0;
+    size_t      compute = 0;
 };
 
-std::vector<common_ctx_device_memory> common_get_context_device_memory(const llama_context * ctx);
+// memory a model needs at the min and max context --fit may pick
+struct common_memory_reports {
+    uint32_t n_ctx_train = 0;
+    uint32_t n_ctx_max   = 0; // the largest context that fits the free device memory right now
+    uint32_t n_ctx_min   = 0; // --fit-ctx (the smallest context --fit may pick), with the placement set in params
+    std::vector<common_memory_breakdown_row> info_max; // breakdown at n_ctx_max
+    std::vector<common_memory_breakdown_row> info_min; // breakdown at n_ctx_min
+};
+
+// rows of common_memory_breakdown_print: model devices first, then host
+std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const llama_context * ctx);
+
+// load model + context with no_alloc and return the memory breakdown, params are used as-is
+// n_ctx_train and n_ctx are optional outputs; throws on failure
+std::vector<common_memory_breakdown_row> common_fit_measure(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+                           uint32_t * n_ctx_train,
+                           uint32_t * n_ctx,
+                     ggml_log_level   log_level);
+
+struct common_params;
+
+// measure min and max without allocating, params may be modified as with --fit; throws on failure
+common_memory_reports common_measure_memory(common_params & params);
 
 struct common_device_memory_data {
     int64_t total;
@@ -78,14 +96,6 @@ struct common_device_memory_data {
 };
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
-
-// Clamp the high bound of GPU layers a single device may take to a user/config-set ceiling.
-// A negative ceiling is the sentinel for "auto / unset" and leaves the bound unchanged; a
-// concrete ceiling caps the bound to it (min), so a config-set n_gpu_layers is an upper limit
-// the fit-to-VRAM search may reduce from rather than an exact pin. Declared here (rather than
-// kept file-static in fit.cpp) purely so the ceiling-not-pin decision can be unit tested
-// without a GPU or a device-memory query; it is otherwise an internal fit.cpp helper.
-uint32_t common_fit_clamp_ngl_ceiling(uint32_t n_unassigned_high, int64_t ngl_ceiling);
 
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(

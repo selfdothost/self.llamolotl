@@ -1,17 +1,23 @@
 diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
-index 1c58d3a..3fe7178 100644
+index 0d79015..0b515ee 100644
 --- a/tools/mtmd/mtmd-helper-gen.cpp
 +++ b/tools/mtmd/mtmd-helper-gen.cpp
-@@ -92,6 +92,8 @@ public:
-     // set out_stop on end-of-speech, h_state_out must be null if no frame is generated
-     virtual int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) = 0;
-     virtual int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
+@@ -110,6 +110,14 @@ public:
+     virtual bool next_is_text() const { return false; }
+ 
+     std::vector<llama_logit_bias> logit_bias; // see mtmd_helper_gen_audio_get_logit_bias()
 +    // non-flushing variant of get_output, for streaming pollers
-+    virtual int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
++    // yard: peek is a POLLER read (non-forcing). Not every pipeline
++    // implements it (upstream 0.9.0 soprano/lfm3a/chatterbox don't) —
++    // default = unsupported, yard pipelines override.
++    virtual int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) {
++        GGML_UNUSED(out_sample_rate); GGML_UNUSED(out_data); GGML_UNUSED(out_data_len); GGML_UNUSED(out_n_samples);
++        return 1;
++    }
  
  protected:
-     llama_context * lctx;
-@@ -132,7 +134,19 @@ public:
+     // one state per generation, so a fixed seed always gives the same output
+@@ -199,7 +207,19 @@ public:
          }
  
          const std::string lang   = tts_resolve_lang((inp->lang && inp->lang[0]) ? inp->lang : "english");
@@ -32,9 +38,9 @@ index 1c58d3a..3fe7178 100644
          if (c_lang == LLAMA_TOKEN_NULL) {
              LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
              return 1;
-@@ -209,6 +223,10 @@ public:
-         seed  = inp->seed;
-         out_type = inp->out_type;
+@@ -279,6 +299,10 @@ public:
+             return 1;
+         }
  
 +        if (inp->wav_window_frames > 0) {
 +            window_frames = (size_t) inp->wav_window_frames;
@@ -43,8 +49,8 @@ index 1c58d3a..3fe7178 100644
          // the prompt above holds the whole text stream up to tts_eos, so every generated
          // frame adds tts_pad on top of the codes embedding
          overlay = row(tts_pad);
-@@ -327,6 +345,31 @@ public:
-         return 0;
+@@ -424,6 +448,31 @@ public:
+         return flush_gen_wav() ? 0 : 1;
      }
  
 +    // like get_output, but does NOT flush pending codes/feats: returns only
@@ -75,10 +81,12 @@ index 1c58d3a..3fe7178 100644
  private:
      bool ensure_cache() {
          if (specials_ok) {
-@@ -366,6 +409,19 @@ private:
+@@ -461,6 +510,55 @@ private:
+         return true;
+     }
  
-     // runs the reference wav through the speaker encoder, returns one x-vector embedding row
-     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
++    // runs the reference wav through the speaker encoder, returns one x-vector embedding row
++    bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
 +        // 2026-10-27: this forward measured ~1.7s per request on the RX 580
 +        // lane and ran on EVERY synthesis. Keyed by bitmap POINTER: the tts
 +        // worker caches bitmaps by (path, mtime, size), so a stable pointer
@@ -92,21 +100,45 @@ index 1c58d3a..3fe7178 100644
 +            return true;
 +        }
 +        LOG_INF("spk-embd cache MISS — running speaker forward\n");
-         if (!mtmd_support_audio(mctx)) {
-             LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
-             return false;
-@@ -394,6 +450,9 @@ private:
-             }
-         }
-         mtmd_input_chunks_free(chunks);
++        if (!mtmd_support_audio(mctx)) {
++            LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
++            return false;
++        }
++        const std::string  marker = mtmd_default_marker();
++        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
++        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
++        const mtmd_bitmap * bptr = bitmap;
++        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
++        if (ok) {
++            ok = false;
++            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
++                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
++                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
++                    continue;
++                }
++                if (mtmd_encode_chunk(mctx, chunk) != 0) {
++                    LOG_ERR("mtmd_helper_gen_audio: speaker encode failed\n");
++                    break;
++                }
++                const float * embd = mtmd_get_output_embd(mctx);
++                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
++                out.assign(embd, embd + n);
++                ok = true;
++                break;
++            }
++        }
++        mtmd_input_chunks_free(chunks);
 +        if (ok) {
 +            s_embd_cache[bitmap] = out;
 +        }
-         return ok;
-     }
- 
-@@ -689,6 +748,29 @@ public:
-         return 0;
++        return ok;
++    }
++
+     // one GEN_WAV process() call over the buffered codes, state is carried across batches
+     bool flush_gen_wav() {
+         if (codes_buf.empty()) {
+@@ -782,6 +880,29 @@ public:
+         return flush_gen_wav() ? 0 : 1;
      }
  
 +    // like get_output, but does NOT flush pending feats
@@ -135,10 +167,12 @@ index 1c58d3a..3fe7178 100644
  private:
      bool ensure_cache() {
          if (specials_ok) {
-@@ -905,6 +987,20 @@ private:
+@@ -996,6 +1117,56 @@ private:
+         return n;
+     }
  
-     // runs the reference wav through the mimi encoder, returns one row per 12.5Hz frame
-     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
++    // runs the reference wav through the mimi encoder, returns one row per 12.5Hz frame
++    bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
 +        // 2026-10-27: same story as the x-vector pipeline above — this is the
 +        // mimi/12.5Hz voice encoder the Qwen3-TTS-12Hz mmproj actually
 +        // instantiates (the diagnostic build proved THIS one runs), and the
@@ -153,23 +187,48 @@ index 1c58d3a..3fe7178 100644
 +            return true;
 +        }
 +        LOG_INF("spk-embd(mimi) cache MISS — running voice forward\n");
-         if (!mtmd_support_audio(mctx)) {
-             LOG_ERR("mtmd_helper_gen_audio: mmproj has no voice encoder\n");
-             return false;
-@@ -933,6 +1029,9 @@ private:
-             }
-         }
-         mtmd_input_chunks_free(chunks);
++        if (!mtmd_support_audio(mctx)) {
++            LOG_ERR("mtmd_helper_gen_audio: mmproj has no voice encoder\n");
++            return false;
++        }
++        const std::string  marker = mtmd_default_marker();
++        mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
++        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
++        const mtmd_bitmap * bptr = bitmap;
++        bool ok = mtmd_tokenize(mctx, chunks, &text, &bptr, 1) == 0;
++        if (ok) {
++            ok = false;
++            for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
++                const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
++                if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
++                    continue;
++                }
++                if (mtmd_encode_chunk(mctx, chunk) != 0) {
++                    LOG_ERR("mtmd_helper_gen_audio: voice encode failed\n");
++                    break;
++                }
++                const float * embd = mtmd_get_output_embd(mctx);
++                const size_t  n = (size_t) llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk);
++                out.assign(embd, embd + n);
++                ok = true;
++                break;
++            }
++        }
++        mtmd_input_chunks_free(chunks);
 +        if (ok) {
 +            s_embd_cache[bitmap] = out;
 +        }
-         return ok;
++        return ok;
++    }
++
+     // decodes the buffered latents, the mimi decoder state carries over between calls
+     bool flush_gen_wav() {
+         if (feats_buf.empty()) {
+@@ -2198,4 +2369,12 @@ int32_t mtmd_helper_gen_audio_flush(mtmd_helper_gen_audio * ctx) {
+         return 1;
      }
- 
-@@ -1060,3 +1159,11 @@ int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t *
-     }
-     return ctx->pipeline->get_output(out_sample_rate, out_data, out_data_len, out_n_samples);
- }
+     return ctx->pipeline->flush();
++    }
 +
 +int32_t mtmd_helper_gen_audio_peek_output(mtmd_helper_gen_audio * ctx, int32_t * out_sample_rate,
 +                                          const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) {
@@ -177,12 +236,12 @@ index 1c58d3a..3fe7178 100644
 +        return 1;
 +    }
 +    return ctx->pipeline->peek_output(out_sample_rate, out_data, out_data_len, out_n_samples);
-+}
+ }
 diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
-index 10f2171..9849a7c 100644
+index a9ffdf7..bd495fc 100644
 --- a/tools/mtmd/mtmd-helper.h
 +++ b/tools/mtmd/mtmd-helper.h
-@@ -207,6 +207,12 @@ struct mtmd_helper_gen_audio_inp {
+@@ -251,6 +251,12 @@ struct mtmd_helper_gen_audio_inp {
      uint32_t seed; // UINT32_MAX for random (default: random)
  
      enum mtmd_helper_gen_audio_outtype out_type;
@@ -194,10 +253,10 @@ index 10f2171..9849a7c 100644
 +    int32_t  wav_window_frames;
  };
  
- MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
-@@ -247,6 +253,16 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
-                         size_t * out_data_len,
-                         int64_t * out_n_samples);
+ MTMD_API struct mtmd_helper_gen_audio_inp mtmd_helper_gen_audio_inp_default(void);
+@@ -311,6 +317,16 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
+ // call once when generation has ended, before the last get_output() in stream mode
+ MTMD_API int32_t mtmd_helper_gen_audio_flush(mtmd_helper_gen_audio * ctx);
  
 +// non-flushing variant of the above: returns only audio that has already been
 +// decoded, without forcing the vocoder to decode a partial window. intended
@@ -212,21 +271,28 @@ index 10f2171..9849a7c 100644
  #ifdef __cplusplus
  } // extern "C"
  #endif
-@@ -290,6 +306,9 @@ struct gen_audio {
-     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
-         return mtmd_helper_gen_audio_get_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
+@@ -400,6 +416,10 @@ struct gen_audio {
+     int32_t flush() {
+         return mtmd_helper_gen_audio_flush(ctx.get());
      }
++
 +    int32_t peek_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
 +        return mtmd_helper_gen_audio_peek_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
 +    }
  };
  
- } // namespace mtmd_helper
+ inline std::vector<llama_logit_bias> audio_stream_logit_bias(const mtmd_context * mctx, const llama_model * model) {
 diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
-index 6fd1936..0a0d1fd 100644
+index 6354be6..fa9e178 100644
 --- a/tools/tts/tts.cpp
 +++ b/tools/tts/tts.cpp
-@@ -6,14 +6,39 @@
+@@ -1,5 +1,4 @@
+ #include "arg.h"
+-#include "chat.h"
+ #include "common.h"
+ #include "sampling.h"
+ #include "log.h"
+@@ -7,14 +6,39 @@
  #include "mtmd.h"
  #include "mtmd-helper.h"
  
@@ -266,7 +332,7 @@ index 6fd1936..0a0d1fd 100644
   */
  
  struct tts_timings {
-@@ -32,105 +57,149 @@ struct tts_timings {
+@@ -33,138 +57,156 @@ struct tts_timings {
      }
  };
  
@@ -331,7 +397,7 @@ index 6fd1936..0a0d1fd 100644
      LOG("\nexample usage:\n");
      LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o output.wav", argv[0]);
 -    LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav\n", argv[0]);
--    LOG("\nnote: --tts-lang and --tts-speaker-file may not be supported in all models");
+-    LOG("\nnote: --tts-lang, --tts-voice and --tts-speaker-file may not be supported in all models");
 +    LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav", argv[0]);
 +    LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o - | ffplay -", argv[0]);
 +    LOG("\n    %s -m backbone.gguf -mm mmproj.gguf --tts-worker < requests.jsonl", argv[0]);
@@ -359,6 +425,9 @@ index 6fd1936..0a0d1fd 100644
 +// swaps them, so key on path + (mtime, size) and reuse the encoded bitmap.
 +static std::unordered_map<std::string, std::pair<std::pair<int64_t, int64_t>, mtmd::bitmap_ptr>> g_spk_cache;
 +
++// model-level predefined voice (resolved once in main; 0.9.0 voice-bearing models)
++static mtmd_bitmap * g_default_voice = nullptr;
++
 +static mtmd_bitmap * acquire_speaker_bitmap(mtmd_context * mctx, const std::string & path) {
 +    struct stat st {};
 +    if (stat(path.c_str(), &st) != 0) {
@@ -379,20 +448,18 @@ index 6fd1936..0a0d1fd 100644
 -    if (params.mmproj.path.empty()) {
 -        LOG_ERR("no mmproj provided, use --mmproj\n");
 -        return 1;
-+    LOG_INF("spk-bitmap cache MISS %s (encoding)\n", path.c_str());
-+    auto wrapper = mtmd_helper_bitmap_init_from_file(mctx, path.c_str(), false, mtmd_helper_init_opt_default());
-+    if (!wrapper.bitmap) {
-+        return nullptr;
-     }
-+    auto res = g_spk_cache.insert_or_assign(path, std::make_pair(stamp, mtmd::bitmap_ptr(wrapper.bitmap)));
-+    return res.first->second.second.get();
-+}
- 
+-    }
+-
 -    // important: keep this file as generic as possible
 -    //            model-specific logic should be in mtmd-helper-gen or mtmd API
 -
 -    // always enable embd, so that we can pass hidden states to the audio generation helper
 -    params.embedding = true;
+-
+-    // for chatterbox multilingual: its cfg pairs slot i with sequence n_parallel + i in a unified kv cache
+-    // TODO: this applies to every model, find a better way for a pipeline to request extra sequences
+-    params.n_parallel *= 2;
+-    params.kv_unified  = true;
 -
 -    llama_backend_init();
 -    llama_numa_init(params.numa);
@@ -432,6 +499,35 @@ index 6fd1936..0a0d1fd 100644
 -        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
 -        if (!wrapper.bitmap) {
 -            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
+-            return 1;
+-        }
+-        speaker_bitmap.reset(wrapper.bitmap);
++    LOG_INF("spk-bitmap cache MISS %s (encoding)\n", path.c_str());
++    auto wrapper = mtmd_helper_bitmap_init_from_file(mctx, path.c_str(), false, mtmd_helper_init_opt_default());
++    if (!wrapper.bitmap) {
++        return nullptr;
+     }
++    auto res = g_spk_cache.insert_or_assign(path, std::make_pair(stamp, mtmd::bitmap_ptr(wrapper.bitmap)));
++    return res.first->second.second.get();
++}
+ 
+-    // a model with predefined voices needs one, the first by default; other models name the voice in the prompt
+-    if (mtmd_gen_audio_get_info(mctx.get()).n_voices > 0 && (!params.tts_voice.empty() || !speaker_bitmap)) {
+-        if (speaker_bitmap) {
+-            LOG_ERR("--tts-voice and --tts-speaker-file cannot be used together\n");
+-            return 1;
+-        }
+-        if (params.tts_voice.empty()) {
+-            params.tts_voice = mtmd_gen_audio_voice_name(mctx.get(), 0);
+-            LOG_WRN("no --tts-voice given, speaking with \"%s\"\n", params.tts_voice.c_str());
+-        }
+-        speaker_bitmap.reset(mtmd_gen_audio_get_voice(mctx.get(), params.tts_voice.c_str()));
+-        if (!speaker_bitmap) {
+-            LOG_ERR("unknown voice \"%s\", the model has:", params.tts_voice.c_str());
+-            for (int32_t i = 0; const char * name = mtmd_gen_audio_voice_name(mctx.get(), i); i++) {
+-                LOG(" %s", name);
+-            }
+-            LOG("\n");
 +static int run_tts_request(common_params & params, llama_context * lctx, mtmd::context_ptr & mctx,
 +                           common_sampler * smpl, const tts_request & req,
 +                           const std::function<void(const void * data, size_t len, bool is_pcm16)> & emit,
@@ -443,10 +539,15 @@ index 6fd1936..0a0d1fd 100644
 +            LOG_ERR("failed to load speaker file %s\n", req.speaker_path.c_str());
              return 1;
          }
--        speaker_bitmap.reset(wrapper.bitmap);
++    } else {
++        speaker_ref = g_default_voice; // 0.9.0 predefined-voice models
      }
  
--    mtmd_helper::gen_audio gen(lctx, mctx.get());
+-    // a model with a "tts" chat template (e.g. LFM3-Audio) speaks the prompt rendered from it
+-    auto tmpls = common_chat_templates_init(model, "");
+-    std::string prompt = common_chat_get_tts_prompt(tmpls.get(), params.prompt, params.tts_lang, params.tts_voice);
+-    if (prompt.empty()) {
+-        prompt = params.prompt;
 +    // 2026-10-27: constructing gen PER REQUEST reset the pipeline's
 +    // specials_ok latch, so ensure_cache() rebuilt the ~1.2 GB token
 +    // embedding table on every synthesis — measured 1.42s/request, the
@@ -455,13 +556,19 @@ index 6fd1936..0a0d1fd 100644
 +    // reset() handles per-request state.
 +    static mtmd_helper::gen_audio * s_gen = nullptr;
 +    if (!s_gen) {
-+        s_gen = new mtmd_helper::gen_audio(lctx, mctx.get());
-+    }
++        // 0.9.0 API: default-construct then init() (ctor signature changed)
++        s_gen = new mtmd_helper::gen_audio();
++        s_gen->init(lctx, mctx.get());
+     }
+-
+-    mtmd_helper::gen_audio gen;
+-    gen.init(lctx, mctx.get());
+-    mtmd_helper_gen_audio_inp inp = mtmd_helper_gen_audio_inp_default();
 +    mtmd_helper::gen_audio & gen = *s_gen;
-     mtmd_helper_gen_audio_inp inp{};
++    mtmd_helper_gen_audio_inp inp{};
      inp.seq_id      = 0;
--    inp.prompt      = params.prompt.c_str();
--    inp.prompt_len  = params.prompt.size();
+-    inp.prompt      = prompt.c_str();
+-    inp.prompt_len  = prompt.size();
 -    inp.speaker_ref = speaker_bitmap.get();
 -    inp.lang        = params.tts_lang.c_str();
 +    inp.prompt      = req.text.c_str();
@@ -471,7 +578,6 @@ index 6fd1936..0a0d1fd 100644
      inp.top_k       = params.sampling.top_k;
      inp.top_p       = params.sampling.top_p;
 -    inp.seed        = params.sampling.seed;
--    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 -
 -    //
 -    // stage 1: process prompt via backbone model, generate semantic representation
@@ -490,7 +596,7 @@ index 6fd1936..0a0d1fd 100644
  
      const int64_t t_prompt_start_us = ggml_time_us();
  
-@@ -152,7 +221,7 @@ int main(int argc, char ** argv) {
+@@ -186,7 +228,7 @@ int main(int argc, char ** argv) {
          return t;
      };
  
@@ -499,7 +605,7 @@ index 6fd1936..0a0d1fd 100644
      int n_frames = 0;
      llama_token sampled = sample_semantic_code();
      const float * h_state = llama_get_embeddings_ith(lctx, -1);
-@@ -160,6 +229,31 @@ int main(int argc, char ** argv) {
+@@ -194,6 +236,31 @@ int main(int argc, char ** argv) {
      tts_timings timings;
      const int64_t t_gen_start_us = ggml_time_us();
  
@@ -531,7 +637,7 @@ index 6fd1936..0a0d1fd 100644
      bool stop = false;
      while (!stop && n_frames < max_new) {
          const float * h_next = nullptr;
-@@ -178,6 +272,10 @@ int main(int argc, char ** argv) {
+@@ -212,6 +279,10 @@ int main(int argc, char ** argv) {
          h_state = h_next;
          sampled = sample_semantic_code();
          timings.report(n_frames);
@@ -542,7 +648,7 @@ index 6fd1936..0a0d1fd 100644
      }
      const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
  
-@@ -194,21 +292,214 @@ int main(int argc, char ** argv) {
+@@ -228,21 +299,239 @@ int main(int argc, char ** argv) {
  
      LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
  
@@ -592,12 +698,9 @@ index 6fd1936..0a0d1fd 100644
 +    }
 +
 +    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_TTS, print_usage)) {
-         return 1;
-     }
--    fwrite(data, 1, data_len, f);
--    fclose(f);
--    LOG_INF("wrote %s\n", params.out_file.c_str());
- 
++        return 1;
++    }
++
 +    mtmd_helper_log_set(common_log_default_callback, nullptr);
 +
 +    if (!worker_mode && params.prompt.empty()) {
@@ -615,6 +718,11 @@ index 6fd1936..0a0d1fd 100644
 +    // always enable embd, so that we can pass hidden states to the audio generation helper
 +    params.embedding = true;
 +
++    // 0.9.0: chatterbox multilingual pairs cfg slot i with sequence
++    // n_parallel + i in a unified kv cache (upstream main does this too)
++    params.n_parallel *= 2;
++    params.kv_unified  = true;
++
 +    llama_backend_init();
 +    llama_numa_init(params.numa);
 +
@@ -627,9 +735,12 @@ index 6fd1936..0a0d1fd 100644
 +    llama_context  * lctx  = llama_init->context();
 +    if (!model || !lctx) {
 +        LOG_ERR("failed to init model/context\n");
-+        return 1;
-+    }
-+
+         return 1;
+     }
+-    fwrite(data, 1, data_len, f);
+-    fclose(f);
+-    LOG_INF("wrote %s\n", params.out_file.c_str());
+ 
 +    mtmd_context_params mtmd_params = mtmd_context_params_default();
 +    mtmd_params.use_gpu = params.mmproj_use_gpu;
 +    mtmd_params.device  = params.mmproj_device;
@@ -643,6 +754,26 @@ index 6fd1936..0a0d1fd 100644
 +        return 1;
 +    }
 +    const int32_t sample_rate = mtmd_gen_audio_get_info(mctx.get()).sample_rate;
++
++    // 0.9.0: models with predefined voices (pocket/soprano etc.) need one;
++    // resolve the requested --tts-voice or the first as the worker default.
++    // Per-request "speaker" (a wav file) still overrides via run_tts_request.
++    if (mtmd_gen_audio_get_info(mctx.get()).n_voices > 0) {
++        std::string voice = params.tts_voice;
++        if (voice.empty()) {
++            voice = mtmd_gen_audio_voice_name(mctx.get(), 0);
++            LOG_WRN("no --tts-voice given, speaking with \"%s\"\n", voice.c_str());
++        }
++        g_default_voice = mtmd_gen_audio_get_voice(mctx.get(), voice.c_str());
++        if (!g_default_voice) {
++            LOG_ERR("unknown voice \"%s\", the model has:\n", voice.c_str());
++            for (int32_t i = 0; const char * name = mtmd_gen_audio_voice_name(mctx.get(), i); i++) {
++                LOG(" %s", name);
++            }
++            LOG("\n");
++            return 1;
++        }
++    }
 +
 +    if (worker_mode) {
 +        printf("{\"ev\":\"ready\",\"sample_rate\":%d}\n", sample_rate);

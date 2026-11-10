@@ -3,6 +3,7 @@ self.llama/.git/
 self.axolotl/
 patches/*
 !patches/0001-tts-streaming-worker.patch
+!patches/0002-router-yard-extensions.patch
 Dockerfile
 Dockerfile.*
 .dockerignore

@@ -1,0 +1,298 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index e3ab084..d280ed6 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3662,6 +3662,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.models_autoload = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
++
++    // yard router extensions (patches/0002): preset-only keys consumed by
++    // server-models-sched. Deliberately STRING handlers even though the values
++    // are numeric: apply_to_params() runs every option's handler, preset-only
++    // ones included, and an int handler would std::stoi() a hand-edited preset
++    // value and throw out of preset loading. The consumers parse defensively
++    // and treat anything unusable as "no claim" -- a footprint hint must never
++    // be able to stop the router from starting.
++    add_opt(common_arg(
++        {"vram-footprint-mib"}, "MIB",
++        "in server router mode, how much VRAM this model configuration occupies once loaded, in MiB. "
++        "Seeds the memory admission check for a configuration not measured yet; a real measurement "
++        "from a measure child or a loaded instance always wins over it",
++        [](common_params &, const std::string &) { /* consumed by server-models-sched */ }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB).set_preset_only());
++    add_opt(common_arg(
++        {"vram-shed-mib-per-layer"}, "MIB",
++        "in server router mode, how much VRAM one expert layer of this model frees when moved "
++        "to system RAM. Lets the router respawn a model that does not fit with a higher "
++        "--n-cpu-moe instead of waiting forever for capacity -- slower, but serving",
++        [](common_params &, const std::string &) { /* consumed by server-models-sched */ }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env(COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER).set_preset_only());
++    add_opt(common_arg(
++        {"pin"}, "BOOL",
++        "in server router mode, never choose this model as the LRU eviction victim while an "
++        "unpinned candidate exists. For always-on support models -- an embedder, a reranker -- "
++        "that a chat-model swap would otherwise silently unload. Pinned models still COUNT "
++        "toward models-max: pinning reserves a slot, it does not create one",
++        [](common_params &, const std::string &) { /* consumed by server-models-sched */ }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env(COMMON_ARG_PRESET_PIN).set_preset_only());
+     add_opt(common_arg(
+         {"--jinja"},
+         {"--no-jinja"},
+diff --git a/common/arg.h b/common/arg.h
+index 203d1b4..d97c3c6 100644
+--- a/common/arg.h
++++ b/common/arg.h
+@@ -152,5 +152,11 @@ bool common_models_handler_is_preset_repo(const common_models_handler & handler)
+ // download and update params with the downloaded model path
+ void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback = nullptr);
+ 
++// yard router extensions (patches/0002): preset-only keys, not CLI flags.
++// Consumed by server-models-sched (declared footprints, expert shedding, pin).
++#define COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB      "__PRESET_VRAM_FOOTPRINT_MIB"
++#define COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER "__PRESET_VRAM_SHED_MIB_PER_LAYER"
++#define COMMON_ARG_PRESET_PIN                      "__PRESET_PIN"
++
+ // initialize argument parser context - used by test-arg-parser and preset
+ common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
+diff --git a/tools/server/server-models-sched.cpp b/tools/server/server-models-sched.cpp
+index 08c1c4c..cd8399f 100644
+--- a/tools/server/server-models-sched.cpp
++++ b/tools/server/server-models-sched.cpp
+@@ -88,10 +88,72 @@ bool server_models_sched::has_capacity(std::unique_lock<std::mutex> & lk) {
+         || count_running() < (size_t) models.base_params.models_max;
+ }
+ 
++//
++// yard router extensions (patches/0002)
++//
++
++// preset-declared footprint for this configuration, in bytes, or 0 (no claim).
++// NOT a guess: it is a measurement somebody took on this card and wrote down.
++// It seeds the admission check only while the measure-child path has not
++// produced a real number (SERVER_MODEL_MEMORY_UNMEASURED / FAILED).
++static int64_t declared_footprint_bytes(const server_model_meta & meta) {
++    std::string value;
++    if (!meta.preset.get_option(COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB, value)) {
++        return 0;
++    }
++    try {
++        const int64_t mib = std::stoll(value);
++        return mib > 0 ? mib * 1024 * 1024 : 0;
++    } catch (const std::exception &) {
++        SRV_WRN("ignoring unparseable vram-footprint-mib for model=%s: '%s\n", meta.name.c_str(), value.c_str());
++        return 0;
++    }
++}
++
++// operator-declared VRAM freed per expert layer moved to system RAM, MiB, or 0.
++static int64_t shed_mib_per_layer(const server_model_meta & meta) {
++    std::string value;
++    if (!meta.preset.get_option(COMMON_ARG_PRESET_VRAM_SHED_MIB_PER_LAYER, value)) {
++        return 0;
++    }
++    try {
++        const int64_t mib = std::stoll(value);
++        return mib > 0 ? mib : 0;
++    } catch (const std::exception &) {
++        SRV_WRN("ignoring unparseable vram-shed-mib-per-layer for model=%s: '%s\n", meta.name.c_str(), value.c_str());
++        return 0;
++    }
++}
++
++static int current_n_cpu_moe(const server_model_meta & meta) {
++    std::string value;
++    if (!meta.preset.get_option("LLAMA_ARG_N_CPU_MOE", value)) {
++        return 0;
++    }
++    try {
++        const int n = std::stoi(value);
++        return n > 0 ? n : 0;
++    } catch (const std::exception &) {
++        return 0;
++    }
++}
++
++// pin is a PREFERENCE here, not a veto: a pinned model is skipped while any
++// unpinned victim exists, and only chosen when nothing else is left. An
++// absolute pin would make a big model permanently unloadable the moment
++// enough support models are pinned.
++static bool meta_is_pinned(const server_model_meta & meta) {
++    std::string value;
++    return meta.preset.get_option(COMMON_ARG_PRESET_PIN, value)
++        && (value == "1" || value == "true" || value == "yes" || value == "on");
++}
++
+ std::string server_models_sched::pick_victim(std::unique_lock<std::mutex> & lk) {
+     check_lock(lk);
+     std::string victim;
+     int64_t victim_last_used = 0;
++    std::string pinned_victim;
++    int64_t pinned_last_used = 0;
+     for (const auto & m : models.mapping) {
+         // a busy model is mid-request, one still coming up has no request to finish
+         if (m.second.req_count != 0 || !m.second.meta.is_ready_or_sleep()) {
+@@ -101,11 +163,25 @@ std::string server_models_sched::pick_victim(std::unique_lock<std::mutex> & lk)
+         if (models.stopping_models.count(m.first) || find(m.first)) {
+             continue;
+         }
++        // yard pin: prefer unpinned victims, fall back to pinned only when
++        // nothing else is left (and say so -- a pin being overridden is
++        // operator-visible information)
++        if (meta_is_pinned(m.second.meta)) {
++            if (pinned_victim.empty() || m.second.meta.last_used < pinned_last_used) {
++                pinned_victim     = m.first;
++                pinned_last_used  = m.second.meta.last_used;
++            }
++            continue;
++        }
+         if (victim.empty() || m.second.meta.last_used < victim_last_used) {
+             victim           = m.first;
+             victim_last_used = m.second.meta.last_used;
+         }
+     }
++    if (victim.empty() && !pinned_victim.empty()) {
++        SRV_WRN("no unpinned eviction candidate left; overriding the pin on name=%s\n", pinned_victim.c_str());
++        return pinned_victim;
++    }
+     return victim;
+ }
+ 
+@@ -146,8 +222,11 @@ bool server_models_sched::try_claim(std::unique_lock<std::mutex> & lk, const std
+     if (!has_capacity(lk)) {
+         return false;
+     }
+-    // over the memory margin with every running model busy: wait for one to go idle
++    // over the memory margin with every running model busy: wait for one to go
++    // idle -- unless the yard shed can make the QUEUED model itself fit
++    // (vram-shed-mib-per-layer, "slower but serving" instead of waiting).
+     if (memory_enabled() && limits_exceeded(lk, model_id, /* verbose */ false) && pick_victim(lk).empty()) {
++        try_shed_to_fit(lk, model_id);
+         return false;
+     }
+     queue.front().loading = true;
+@@ -305,6 +384,68 @@ void server_models_sched::make_room(const std::string & name) {
+     }
+ }
+ 
++// yard (patches/0002): push more expert layers to system RAM so a queued model
++// that cannot fit, fits. The lever is --n-cpu-moe, applied strictly at LOAD
++// time, so this rewrites the preset of a model that is about to (re)spawn --
++// cheap orchestration, no tensor surgery. Sizing is operator-declared
++// (vram-shed-mib-per-layer): anchored on a measured point, only has to get over
++// a threshold the child then re-checks for itself, so an optimistic figure
++// cannot turn a wait into silent corruption. Returns true when the config was
++// rewritten and the next admission pass should be attempted.
++bool server_models_sched::try_shed_to_fit(std::unique_lock<std::mutex> & lk, const std::string & name) {
++    check_lock(lk);
++    auto it = models.mapping.find(name);
++    if (it == models.mapping.end() || it->second.meta.is_running()) {
++        return false; // only a not-yet-spawned model can be reshaped here
++    }
++    server_model_meta & meta = it->second.meta;
++
++    const int64_t per_layer_mib = shed_mib_per_layer(meta);
++    if (per_layer_mib <= 0) {
++        return false; // no claim -> keep waiting, exactly as before
++    }
++    const auto missing = deficit(name);
++    if (missing.empty()) {
++        return false; // not the shortfall case
++    }
++    int64_t deficit_bytes = 0;
++    for (const auto & [dev, bytes] : missing) {
++        (void) dev;
++        deficit_bytes += (int64_t) bytes;
++    }
++    const int64_t per_layer_bytes = per_layer_mib * 1024 * 1024;
++    // round UP: shedding half a layer is not a thing; landing one layer heavy
++    // is an OOM while landing one light is only slower
++    const int64_t extra_layers = (deficit_bytes + per_layer_bytes - 1) / per_layer_bytes;
++    const int64_t shed_bytes   = extra_layers * per_layer_bytes;
++
++    // the declaration must move with the config it describes; if shedding
++    // would take the declared footprint to zero the linear model has been
++    // extrapolated past where it means anything -- keep waiting instead
++    const int64_t declared = declared_footprint_bytes(meta);
++    if (declared > 0 && declared - shed_bytes <= 0) {
++        SRV_INF("vram shed: model name=%s needs %lld more expert layer(s) on CPU than its declared "
++                "footprint can account for; not shedding\n", name.c_str(), (long long) extra_layers);
++        return false;
++    }
++
++    const int new_ncmoe = current_n_cpu_moe(meta) + (int) extra_layers;
++    SRV_INF("vram shed: model name=%s is short by %lld MiB; moving %lld expert layer(s) to system RAM "
++            "(-ncmoe -> %d, %lld MiB/layer). SLOWER BUT SERVING\n",
++            name.c_str(), (long long) (deficit_bytes / (1024 * 1024)),
++            (long long) extra_layers, new_ncmoe, (long long) per_layer_mib);
++
++    meta.preset.set_option(models.ctx_preset, "LLAMA_ARG_N_CPU_MOE", std::to_string(new_ncmoe));
++    if (declared > 0) {
++        meta.preset.set_option(models.ctx_preset, COMMON_ARG_PRESET_VRAM_FOOTPRINT_MIB,
++                               std::to_string((declared - shed_bytes) / (1024 * 1024)));
++    }
++    // re-render argv so the child actually spawns with the shed setting;
++    // without this the preset says one thing and the process another
++    meta.update_args(models.ctx_preset, models.bin_path);
++    return true;
++}
++
+ //
+ // memory accounting
+ //
+@@ -572,10 +713,29 @@ int64_t server_models_sched::available(const std::string & dev) const {
+ std::map<std::string, size_t> server_models_sched::deficit(const std::string & name) const {
+     std::map<std::string, size_t> res;
+     auto it = models.mapping.find(name);
+-    if (it == models.mapping.end() || !it->second.meta.memory.min) {
++    if (it == models.mapping.end()) {
+         return res;
+     }
+     const int64_t margin = (int64_t) models.base_params.models_memory_margin * 1024 * 1024;
++    if (!it->second.meta.memory.min) {
++        // yard: a declared footprint (vram-footprint-mib) seeds the admission
++        // check while the measure path has no number yet. Card-total semantics:
++        // the claim is charged against every known device -- exact on the
++        // single-GPU yard, conservative on multi-GPU, and a real measurement
++        // replaces it the moment one exists.
++        const int64_t declared = declared_footprint_bytes(it->second.meta);
++        if (declared <= 0) {
++            return res;
++        }
++        for (const auto & [dev, dm] : device_memory) {
++            (void) dm;
++            const int64_t avail = available(dev) - margin;
++            if (declared > avail) {
++                res[dev] = (size_t) (declared - avail);
++            }
++        }
++        return res;
++    }
+     for (const auto & d : it->second.meta.memory.min->devices) {
+         // host memory is assumed unlimited, same as --fit
+         if (!d.is_device() || d.total == 0) {
+diff --git a/tools/server/server-models-sched.h b/tools/server/server-models-sched.h
+index dda80fc..0a18460 100644
+--- a/tools/server/server-models-sched.h
++++ b/tools/server/server-models-sched.h
+@@ -2,6 +2,8 @@
+ 
+ #include "server-common.h"
+ 
++#include "arg.h" // yard (patches/0002): COMMON_ARG_PRESET_* keys
++
+ #include <deque>
+ #include <map>
+ #include <memory>
+@@ -112,6 +114,11 @@ struct server_models_sched {
+     // wait for the measure of name, then unload idle LRU models until it fits; call without models.mutex
+     void make_room(const std::string & name);
+ 
++    // yard (patches/0002): last-resort fit for a queued model the card cannot
++    // hold -- push more expert layers to system RAM via vram-shed-mib-per-layer
++    // and rewrite the preset, else the queue keeps waiting (upstream semantics).
++    bool try_shed_to_fit(std::unique_lock<std::mutex> & lk, const std::string & name);
++
+     //
+     // memory accounting (--models-memory-margin), the router never touches a GPU
+     // track what each instance holds, child reports only calibrate the rest: works for per-process (Metal) and system-wide (CUDA) free memory

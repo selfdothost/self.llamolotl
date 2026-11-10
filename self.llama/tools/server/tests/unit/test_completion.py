@@ -1,6 +1,5 @@
 import pytest
 import requests
-import threading
 import time
 import random
 
@@ -149,7 +148,7 @@ def test_completion_stream_with_openai_library_stops():
         if choice.finish_reason is None:
             assert choice.text is not None
             output_text += choice.text
-    assert match_regex("Sure, here's one for[\\s\\S]*", output_text), f'Unexpected output: {output_text}'
+    assert match_regex("Sure, here's one for[\\s\\S]*|Sure! Here's one for you[\\s\\S]*", output_text), f'Unexpected output: {output_text}'
 
 
 @pytest.mark.parametrize("n_slots", [1, 2])
@@ -237,6 +236,29 @@ def test_nocache_long_input_prompt():
         "cache_prompt": False,
     })
     assert res.status_code == 400
+
+
+# a request pinned to a busy slot leaves the generation running on it untouched
+def test_pinned_request_on_busy_slot():
+    global server
+    server.n_ctx = 4096
+    server.start()
+    story = "Once upon a time a dragon named Ember guarded a golden key in a deep cave. " * 8
+
+    def run(pin_busy: bool) -> str:
+        server.make_request("POST", "/completion", data={"prompt": story, "id_slot": 0, "n_predict": 4, "temperature": 0.0})
+        res = server.make_stream_request("POST", "/completion", data={
+            "prompt": "To bake bread, mix flour, water and salt, then",
+            "id_slot": 0, "n_predict": 1024, "ignore_eos": True, "temperature": 0.0, "stream": True,
+        })
+        content = next(res)["content"]
+        if pin_busy:
+            server.make_request("POST", "/completion", data={"prompt": story + "The dragon", "id_slot": 0, "n_predict": 4, "temperature": 0.0})
+        return content + "".join(chunk["content"] for chunk in res)
+
+    baseline = run(pin_busy=False)
+    assert run(pin_busy=True) == baseline
+
 
 def test_json_prompt_no_mtmd():
     global server
@@ -395,7 +417,12 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
     results = parallel_function_calls(tasks)
     for res, n_predict, expect_ok in zip(results, n_predict_vals, expected_success):
         if expect_ok:
-            assert res.status_code == 200
+            # the pool is aborted as a whole, so a request that fits on its own
+            # is still dropped when the slots overlap, and it says so explicitly
+            assert res.status_code == 200 or (
+                res.status_code == 500
+                and "context size has been exceeded" in res.body["error"]["message"].lower()
+            )
 
         # note: https://github.com/ggml-org/llama.cpp/pull/18700#issuecomment-3728695581
         if res.status_code == 200:
@@ -610,196 +637,25 @@ def test_cancel_request():
     server.n_predict = -1
     server.n_slots = 1
     server.server_slots = True
+    server.enable_ctx_shift = True
     server.start()
-    # send a request that will take a long time, but cancel it before it finishes
+    # context shift keeps the generation running until the request is cancelled
     try:
         server.make_request("POST", "/completion", data={
             "prompt": "I believe the meaning of life is",
         }, timeout=0.1)
     except requests.exceptions.ReadTimeout:
         pass # expected
-    # make sure the slot is free
-    time.sleep(2)
-    res = server.make_request("GET", "/slots")
-    assert res.body[0]["is_processing"] == False
-
-
-def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
-    deadline = time.time() + timeout
+    # the slot is freed once the server notices the closed connection
+    deadline = time.time() + 10
     while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return predicate()
+        res = server.make_request("GET", "/slots")
+        if not res.body[0]["is_processing"]:
+            return
+        time.sleep(0.1)
+    raise AssertionError("slot is still processing after the request was cancelled")
 
 
-def _stream_chat_and_collect(server: ServerProcess, content: str, results: dict) -> None:
-    """Background-thread worker: streams a chat completion, records the
-    completion id from the first chunk into `results["id"]`, counts content
-    chunks into `results["n_chunks"]`, and marks `results["ended"] = True`
-    once the stream terminates (naturally or via cancel). Any exception is
-    captured in `results["error"]` rather than raised, since this runs off
-    the main test thread.
-    """
-    try:
-        for data in server.make_stream_request("POST", "/chat/completions", data={
-            "messages": [{"role": "user", "content": content}],
-            "stream": True,
-        }):
-            if "id" not in results and data.get("id"):
-                results["id"] = data["id"]
-            choices = data.get("choices") or []
-            if choices and choices[0].get("delta", {}).get("content"):
-                results["n_chunks"] = results.get("n_chunks", 0) + 1
-    except Exception as e:
-        results["error"] = str(e)
-    finally:
-        results["ended"] = True
-
-
-def test_explicit_cancel_request():
-    """self.ai#39 R2: an explicit POST /v1/chat/completions/control
-    {"action": "cancel"} call stops an in-flight generation immediately,
-    without requiring the client to drop its connection and without waiting
-    out HTTP_POLLING_SECONDS -- unlike test_cancel_request() above, the
-    client connection here is kept open the whole time."""
-    global server
-    server.n_ctx = 4096
-    server.n_predict = -1
-    server.n_slots = 1
-    server.server_slots = True
-    server.start()
-
-    results: dict = {}
-    t = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story", results), daemon=True)
-    t.start()
-
-    # wait until generation has actually started (we've seen a completion id)
-    assert _wait_until(lambda: "id" in results, timeout=10.0), "never received a completion id from the stream"
-    cmpl_id = results["id"]
-
-    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
-        "id": cmpl_id,
-        "action": "cancel",
-    })
-    assert cancel_res.status_code == 200
-    assert cancel_res.body.get("success") is True
-
-    # the client's own stream must end on its own (a proper final chunk +
-    # [DONE]), not hang waiting for a chunk that never comes -- this is only
-    # true because the CANCEL task handler now sends a final response before
-    # releasing the slot (see server-context.cpp SERVER_TASK_TYPE_CANCEL)
-    assert _wait_until(lambda: results.get("ended", False), timeout=2.0), \
-        "stream did not end promptly after explicit cancel (client-visible hang)"
-    assert "error" not in results, f"stream ended with an error: {results.get('error')}"
-
-    # the slot must be free well within one HTTP_POLLING_SECONDS interval,
-    # since the cancel is now a push instead of a poll
-    assert _wait_until(
-        lambda: server.make_request("GET", "/slots").body[0]["is_processing"] == False,
-        timeout=1.0,
-    ), "slot was not freed promptly after explicit cancel"
-
-
-def test_explicit_cancel_unknown_id():
-    """Cancelling a completion id that never existed must be a clean no-op,
-    not a crash, hang, or 500."""
-    global server
-    server.start()
-    res = server.make_request("POST", "/v1/chat/completions/control", data={
-        "id": "chatcmpl-does-not-exist",
-        "action": "cancel",
-    })
-    assert res.status_code == 200
-    assert res.body.get("success") is False
-
-
-def test_explicit_cancel_already_completed():
-    """Cancelling a completion id that has already finished must be a clean
-    no-op, not a crash, hang, or 500 -- the slot has already been released
-    and reused by the time the (now-stale) id is looked up."""
-    global server
-    server.n_predict = 4
-    server.start()
-    res = server.make_request("POST", "/chat/completions", data={
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 4,
-    })
-    assert res.status_code == 200
-    cmpl_id = res.body["id"]
-
-    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
-        "id": cmpl_id,
-        "action": "cancel",
-    })
-    assert cancel_res.status_code == 200
-    assert cancel_res.body.get("success") is False
-
-
-def test_explicit_cancel_no_cross_slot():
-    """self.ai#39 R2: cancelling one in-flight completion's id must not
-    affect a different, concurrently-running completion on another slot.
-    completion ids are 32-char random strings minted fresh per request
-    (gen_chatcmplid()), so a collision would only be possible from a
-    targeting bug in the cancel handler, not from the id space itself --
-    this test exercises the real targeting path with two genuinely
-    concurrent requests rather than simulating the race.
-    """
-    global server
-    server.n_ctx = 4096
-    server.n_predict = -1
-    server.n_slots = 2
-    server.server_slots = True
-    server.start()
-
-    results_a: dict = {}
-    results_b: dict = {}
-    t_a = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story about apples", results_a), daemon=True)
-    t_b = threading.Thread(target=_stream_chat_and_collect, args=(server, "Tell a very long story about oranges", results_b), daemon=True)
-    t_a.start()
-    t_b.start()
-
-    assert _wait_until(lambda: "id" in results_a and "id" in results_b, timeout=10.0), \
-        "both concurrent streams should have started and reported an id"
-    assert results_a["id"] != results_b["id"]
-
-    # cancel only A
-    cancel_res = server.make_request("POST", "/v1/chat/completions/control", data={
-        "id": results_a["id"],
-        "action": "cancel",
-    })
-    assert cancel_res.status_code == 200
-    assert cancel_res.body.get("success") is True
-
-    # A must end promptly
-    assert _wait_until(lambda: results_a.get("ended", False), timeout=2.0), \
-        "cancelled stream A did not end promptly"
-    assert "error" not in results_a
-
-    # exactly one slot (B's) should still be processing right after A's
-    # cancel -- proves the cancel targeted only A's slot, not B's
-    def only_b_processing():
-        slots = server.make_request("GET", "/slots").body
-        processing = [s for s in slots if s["is_processing"]]
-        return len(processing) == 1
-    assert _wait_until(only_b_processing, timeout=1.0), \
-        "expected exactly one slot (B's) still processing after A's explicit cancel"
-    assert results_b.get("ended", False) is False, "B's stream must not have been cancelled by A's cancel call"
-
-    # cleanup: cancel B too so the test doesn't leave a background generation
-    # running past teardown
-    if "id" in results_b:
-        server.make_request("POST", "/v1/chat/completions/control", data={
-            "id": results_b["id"],
-            "action": "cancel",
-        })
-    t_a.join(timeout=5)
-    t_b.join(timeout=5)
-
-
-# this test exercises the host-memory prompt cache
-# ref: https://github.com/ggml-org/llama.cpp/pull/16391
-# ref: https://github.com/ggml-org/llama.cpp/pull/17078
 # this test exercises the host-memory prompt cache
 # ref: https://github.com/ggml-org/llama.cpp/pull/16391
 # ref: https://github.com/ggml-org/llama.cpp/pull/17078
@@ -838,3 +694,81 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+# a slot that switched to an unrelated prompt must not restore a context checkpoint of the previous one
+def test_completion_checkpoint_after_unrelated_prompt():
+    global server
+    server = ServerPreset.tinygemma3()
+    server.n_slots = 1
+    server.cache_ram = 0
+    server.temperature = 0.0
+    server.start()
+
+    def tokenize(content):
+        res = server.make_request("POST", "/tokenize", data={"content": content})
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    def top_logprobs(prompt, cache_prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 1,
+            "n_probs": 5,
+            "cache_prompt": cache_prompt,
+        })
+        assert res.status_code == 200
+        return [(p["id"], p["logprob"]) for p in res.body["completion_probabilities"][0]["top_logprobs"]]
+
+    tokens = tokenize("Purple elephants quietly compose sonnets about tax law")
+    expected = top_logprobs(tokens[:2], False)
+
+    # 5 tokens: the checkpoint 4 tokens before the end of the prompt holds only its first token
+    top_logprobs(tokenize("The quick brown fox jumps over the lazy dog")[:5], True)
+    top_logprobs(tokens[:1], True)
+    actual = top_logprobs(tokens[:2], True)
+
+    assert [tid for tid, _ in actual] == [tid for tid, _ in expected]
+    for (_, lp), (_, lp_expected) in zip(actual, expected):
+        assert lp == pytest.approx(lp_expected, abs=1e-3)
+
+
+# a restored context checkpoint must be kept for the next request that shares the same prefix
+def test_completion_checkpoint_kept_after_restore():
+    global server
+    server = ServerPreset.tinygemma3()
+    server.n_slots = 1
+    server.n_batch = 16
+    server.n_ubatch = 16
+    server.cache_ram = 0
+    server.temperature = 0.0
+    server.start()
+
+    def tokenize(content):
+        res = server.make_request("POST", "/tokenize", data={"content": content})
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    def cache_n(prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 1,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]["cache_n"]
+
+    prefix = tokenize("Purple elephants quietly compose sonnets about tax law in the moonlight")
+    suffixes = [tokenize(s) for s in [
+        "The quick brown fox jumps over the lazy dog while the farmer counts his sheep and the sun slowly sets behind the distant hills",
+        "Seven tiny robots repaired the broken lighthouse lens before the storm arrived, then danced on the rocks until the morning tide came in",
+        "Green apples rolled down the hill toward the river, where a curious otter collected them one by one and stacked them on a flat stone",
+    ]]
+
+    # 4 tokens: the checkpoint 4 tokens before the end of the prompt holds exactly the prefix
+    cache_n(prefix + suffixes[0][:4])
+
+    # suffixes longer than n_ubatch + 4: no new checkpoint within the prefix, only the restored one can be reused
+    for suffix in suffixes[1:]:
+        assert len(suffix) > server.n_ubatch + 4
+        assert cache_n(prefix + suffix) == len(prefix) - 1

@@ -33,8 +33,11 @@ WORKDIR /llama-src
 COPY self.llama/ .
 
 # yard patch: llama-tts streaming emission + resident stdio worker
-# (tools/tts + tools/mtmd). Generated against upstream bd4eeaa; applies to
-# the vendored tree with small offsets (verified).
+# (tools/tts + tools/mtmd). Regenerated against upstream v0.9.0 (cd959bae)
+# 2026-11-07: 3-way port of the bd4eeaa-era patch — upstream absorbed the
+# streaming step_gen base and added flush(); yard keeps peek_output (poller)
+# + speaker-embedding caches + wav_window_frames alongside it. Verified
+# applies clean to the pristine tree (patch -p1 --dry-run).
 COPY patches/0001-tts-streaming-worker.patch /tmp/
 RUN patch -p1 < /tmp/0001-tts-streaming-worker.patch
 

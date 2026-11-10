@@ -7,23 +7,10 @@ from utils import *
 @pytest.fixture(scope="session", autouse=True)
 def configure_worker_port(request):
     worker_id = getattr(request.config, "workerinput", {}).get("workerid", "master")
-    if worker_id != "master":
-        worker_num = int(worker_id[2:])
-        os.environ["PORT"] = str(8080 + worker_num * 10)
+    worker_num = 0 if worker_id == "master" else int(worker_id[2:])
+    port_base = int(os.environ.get("LLAMA_SERVER_TEST_PORT_BASE", "8080"))
+    os.environ["PORT"] = str(port_base + worker_num * 10)
 
-# Servers started with --slot-save-path flush an "autoswap-<alias>.slot<N>.llama"
-# snapshot for every non-empty slot on graceful exit (self.llamolotl#54), and the
-# next server with the same alias restores those snapshots at boot. Across tests
-# that share the default "./tmp" save dir + "tinyllama-2" alias, a previous
-# test's shutdown would otherwise leak its slot state into the next test's
-# fresh server (observed as a prompt-cache hit in test_slot_erase). Wipe the
-# auto-snapshots before each test so every test starts from clean slots.
-@pytest.fixture(autouse=True)
-def clean_slot_autoswap_snapshots():
-    if os.path.isdir("./tmp"):
-        for name in os.listdir("./tmp"):
-            if name.startswith("autoswap-"):
-                os.remove(os.path.join("./tmp", name))
 
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test
 @pytest.fixture(autouse=True)

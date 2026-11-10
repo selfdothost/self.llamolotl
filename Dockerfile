@@ -46,6 +46,13 @@ RUN apt-get update && \
 WORKDIR /llama-src
 COPY self.llama/ .
 
+# yard patch 0002: router VRAM-citizenship extensions (preset-only keys
+# vram-footprint-mib / vram-shed-mib-per-layer / pin, declared-footprint
+# admission fallback, pin-aware LRU, expert-shed respawn). The CUDA lane's
+# ONLY yard patch — 0001 (tts streaming) is vulkan-lane only.
+COPY patches/0002-router-yard-extensions.patch /tmp/
+RUN patch -p1 < /tmp/0002-router-yard-extensions.patch
+
 RUN export LDFLAGS="-L/usr/local/cuda/lib64/stubs $LDFLAGS" && \
     cmake -B build \
       -DGGML_NATIVE=OFF \

@@ -5,17 +5,21 @@
 #include "preset.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-models-sched.h"
 #include "server-queue.h"
 
+#include <atomic>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 /**
  * state diagram:
@@ -31,6 +35,7 @@
 enum server_model_status {
     // TODO: also add downloading state when the logic is added
     SERVER_MODEL_STATUS_DOWNLOADING,
+    SERVER_MODEL_STATUS_INCOMPLETE, // a download that never finished, listed without an instance
     SERVER_MODEL_STATUS_DOWNLOADED,
     SERVER_MODEL_STATUS_UNLOADED,
     SERVER_MODEL_STATUS_LOADING,
@@ -44,14 +49,10 @@ enum server_model_source {
     SERVER_MODEL_SOURCE_CACHE,
 };
 
-enum server_child_mode {
-    SERVER_CHILD_MODE_NORMAL,   // load the model and run normally
-    SERVER_CHILD_MODE_DOWNLOAD, // download the model and exit
-};
-
 static std::string server_model_status_to_string(server_model_status status) {
     switch (status) {
         case SERVER_MODEL_STATUS_DOWNLOADING: return "downloading";
+        case SERVER_MODEL_STATUS_INCOMPLETE:  return "incomplete";
         case SERVER_MODEL_STATUS_DOWNLOADED:  return "downloaded";
         case SERVER_MODEL_STATUS_UNLOADED:    return "unloaded";
         case SERVER_MODEL_STATUS_LOADING:     return "loading";
@@ -70,40 +71,6 @@ static std::string server_model_source_to_string(server_model_source source) {
     }
 }
 
-// Terminal load error (issue #27): raised when an incoming model's estimated VRAM
-// footprint still doesn't fit in free GPU memory after vram-aware eviction has run out
-// of resident models it's safe to evict -- i.e. the model doesn't fit at all, not the
-// two-models-should-have-been-evicted case #22 handles. Carries the three facts a caller
-// (or a proxy forwarding the failure) needs to explain it: the model name, its estimated
-// footprint, and the free VRAM measured at decision time, all in bytes. Raised by
-// server_models::evict_for_vram() (T-005) and mapped to a structured HTTP 503 in
-// ex_wrapper (T-006). The formatted message mirrors the SRV_WRN wording in
-// evict_for_vram(), reporting the byte figures in MiB.
-struct server_model_vram_unfittable_error : std::runtime_error {
-    std::string model_name;
-    int64_t     estimated_footprint_bytes;
-    int64_t     free_vram_bytes;
-
-    server_model_vram_unfittable_error(
-            const std::string & model_name,
-            int64_t estimated_footprint_bytes,
-            int64_t free_vram_bytes)
-        : std::runtime_error(format_message(model_name, estimated_footprint_bytes, free_vram_bytes)),
-          model_name(model_name),
-          estimated_footprint_bytes(estimated_footprint_bytes),
-          free_vram_bytes(free_vram_bytes) {}
-
-    static std::string format_message(
-            const std::string & model_name,
-            int64_t estimated_footprint_bytes,
-            int64_t free_vram_bytes) {
-        return "model name=" + model_name + " does not fit in VRAM: needs an estimated " +
-               std::to_string(estimated_footprint_bytes / (1024 * 1024)) +
-               " MiB but only " + std::to_string(free_vram_bytes / (1024 * 1024)) +
-               " MiB is free, and no more resident models are safe to evict";
-    }
-};
-
 struct server_model_meta {
     server_model_source source = SERVER_MODEL_SOURCE_CACHE;
     common_preset preset;
@@ -118,18 +85,12 @@ struct server_model_meta {
     json progress; // reflect load or download progress info, if any
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
-    mtmd_caps multimodal; // multimodal capabilities
     bool hidden = false; // hidden from GET /models, but still accept if requested
-    // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
-    // YARD ADDITION (self.ai#128): exempt from LRU eviction, set from the preset's
-    // `pin` option. A pinned model still COUNTS toward models_max -- it reserves a
-    // slot rather than creating one -- it is only never chosen as the victim.
-    //
-    // Deliberately LAST. This struct is aggregate-initialised positionally with
-    // /* field */ comments in server-models.cpp; a member inserted mid-struct
-    // silently re-binds every initialiser after it. Appending leaves those sites
-    // untouched and lets the NSDMI below supply the default.
-    bool pinned = false;
+    json architecture = server_model_architecture_json(false, false, false, {"text"});
+    uint32_t n_ctx_train = 0; // trained context, read from the GGUF metadata; 0 when unknown
+
+    // only populated with --models-memory-margin, see server_models_sched
+    server_model_memory_info memory = {};
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -148,47 +109,81 @@ struct server_model_meta {
     }
 
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
-    void update_caps();
+    void update_caps(const common_params & base);
+};
+
+// a download that never finished: the tag it was asked under, the sidecar kinds it
+// pulls and the partial files its plan writes
+struct server_unfinished_download {
+    std::string                          model;
+    std::vector<std::string>             sidecars;
+    std::vector<common_download_partial> partials;
+};
+
+// the downloads that never finished, recorded next to the model cache. The cache names
+// partial files after their content hash, so this record is the only trace of what is
+// still incomplete: it lets a restarted router list, resume or remove them
+// a partial another recorded download also writes is never deleted
+// these functions are thread-safe
+struct server_unfinished_downloads {
+    // read the record an earlier run left
+    void load();
+
+    // record a download that starts, replacing an earlier record of the same model,
+    // and delete the partials of that record the new plan no longer writes
+    void add(const server_unfinished_download & download);
+
+    // forget a download whose files are complete
+    void forget(const std::string & model);
+
+    // forget a download and delete its partials; returns false when it is not recorded
+    bool remove(const std::string & model);
+
+    // drop the sidecar `kind` from a download and delete its partials; returns false
+    // when the download is not recorded with that kind
+    bool remove_sidecar(const std::string & model, const std::string & kind);
+
+    // every recorded download
+    std::vector<server_unfinished_download> get_all();
+
+private:
+    std::mutex mutex;
+    std::vector<server_unfinished_download> downloads;
+
+    // write the record back; callers hold the mutex
+    void save();
+
+    // delete the partials of `parts` no recorded download writes; callers hold the mutex
+    void delete_partials(const std::vector<common_download_partial> & parts);
 };
 
 struct server_models_routes;
-struct server_subproc;   // defined in server-models.cpp
-struct server_lru_sched; // defined in server-models.cpp
-
-// How big a model configuration is, and how we know (self.ai#107).
-//
-// `source` is as load-bearing as `bytes` for anything downstream: a "measured"
-// figure is what a child of ours actually reported, while "estimated" is a file
-// size plus an overhead percentage and "declared" is an operator's claim. A
-// consumer deciding whether to reclaim another tenant's VRAM on the strength of
-// this number deserves to know which one it got.
-//
-// bytes == 0 means UNKNOWN -- not "this model is free". Callers must treat it as
-// absence of information; `source` is nullptr in that case.
-struct footprint_info {
-    int64_t      bytes  = 0;
-    const char * source = nullptr; // "measured" | "declared" | "estimated" | nullptr
-};
+struct server_monitor; // defined in server-models.cpp
 
 struct server_models {
     friend struct server_models_routes;
-    friend struct server_lru_sched;
+    friend struct server_models_sched;
+    friend struct server_monitor;
 
 private:
     struct instance_t {
-        std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
-        std::thread th;
+        std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
+
+        // ask the child to exit (it handles the command on its stdin, see server_role::setup)
+        void request_exit() const;
     };
 
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
 
-    // for stopping models
-    std::condition_variable cv_stop;
+    // models asked to stop, still counted as running until the monitor records their exit
     std::set<std::string> stopping_models;
+
+    // downloads that never finished, with the sidecar kinds they pull
+    server_unfinished_downloads unfinished_downloads;
 
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
@@ -255,44 +250,6 @@ private:
         std::unordered_map<std::string, entry_t> map;
     };
 
-    // Measured VRAM footprint per model CONFIGURATION (issue #36), in bytes.
-    //
-    // Keyed by the model's effective launch options, NOT by its name: the same
-    // GGUF at n-cpu-moe=40 and at n-cpu-moe=25 occupies wildly different
-    // amounts of card, so a cache keyed on identity alone would reproduce the
-    // bug it exists to replace. An absent entry means "this configuration has
-    // never been loaded here", which is not the same as zero and must not be
-    // treated as it -- see lookup_measured_footprint().
-    //
-    // Populated from what the child measures about itself once it is ready, so
-    // it is lost on router restart and re-learned on first load. That is
-    // deliberate: a footprint that survived a restart could outlive the driver,
-    // the build, or the card it was measured on.
-    //
-    // The cost of that choice is the window before the first load of each
-    // configuration, where a split (-ncmoe / -ot) model has no admission check
-    // at all -- see #39. A preset may carry vram-footprint-mib to cover the
-    // window; an entry here always outranks it.
-    std::map<std::string, int64_t> measured_footprints;
-
-    // Stable identity for the cache above: the effective preset with the
-    // per-instance HOST/PORT/ALIAS injections update_args() adds stripped back
-    // out, so two launches of the same configuration hash the same.
-    static std::string footprint_key(const server_model_meta & meta);
-
-    // Record what a now-ready child reported about itself. Caller must hold mutex.
-    void record_measured_footprint(const server_model_meta & meta);
-
-    // Measured footprint for this configuration, or nullopt if never loaded.
-    // Caller must hold mutex.
-    std::optional<int64_t> lookup_measured_footprint(const server_model_meta & meta);
-
-    // How big a configuration is, in bytes, or 0 for unknown: measured, else
-    // declared via vram-footprint-mib (#39), else the file-size estimate, else
-    // unknown. The single sizing rule for evict_for_vram(), so an incoming model
-    // and the resident ones are never sized differently. Caller must hold mutex.
-    footprint_info footprint_bytes(const server_model_meta & meta);
-
     common_preset_context ctx_preset;
 
     common_params base_params;
@@ -300,58 +257,31 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
-    // queue of requests waiting for a models_max slot
-    std::unique_ptr<server_lru_sched> sched;
+    // request queue (models_max) and memory accounting
+    std::unique_ptr<server_models_sched> sched;
 
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
-
-    // VRAM-aware supplement to unload_lru() (issue #22): evict LRU resident model(s), if any,
-    // until the incoming model's MEASURED VRAM footprint (+ safety margin) fits in currently
-    // free GPU memory, or until there's nothing left it's safe to evict. Best-effort and
-    // conservative: no-ops (falls back to the models_max count-based limit only) if free VRAM
-    // can't be queried or this configuration has never been loaded here, so its footprint is
-    // unknown -- see the implementation comment in server-models.cpp for why and its limitations.
-    // Terminal case (issue #27): if nothing is left it's safe to evict and the incoming model
-    // still won't fit, this THROWS server_model_vram_unfittable_error (above) rather than
-    // letting the load proceed into an OOM; ex_wrapper maps it to a structured HTTP 503 (T-006).
-    void evict_for_vram(const server_model_meta & incoming);
-
-    // Issue #29: rewrite an unfittable model's config to push more expert layers
-    // to system RAM, so it loads degraded instead of being refused. True when the
-    // config was rewritten and the load should proceed; false when no shed can be
-    // sized and the caller should refuse as before. Only called once nothing else
-    // is evictable, so it competes with a refusal rather than a cheaper option.
-    bool try_shed_to_fit(const server_model_meta & incoming,
-                         int64_t needed_bytes,
-                         int64_t budget_bytes);
-
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
-    // ask the monitoring thread to stop a running instance
+    // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
     // not thread-safe, caller must hold mutex
-    void request_stop(const std::string & name);
+    void request_stop(const std::string & name, bool send_exit = true);
+
+    // let the monitor watch a child; kill_after > 0 force-kills it after that many seconds
+    void watch_child(const std::string & name, std::shared_ptr<server_subproc> proc, server_role_type role, int port, int kill_after = 0);
+
+    // called by the monitor once a child exited and was reaped
+    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_role_type role, int exit_code);
 
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
 public:
-    // Public, lock-taking wrapper over footprint_bytes() for reporting (#107).
-    //
-    // GET /v1/models runs outside the mutex over copies from get_all_meta(),
-    // but the measured-footprint map is shared state, so the lookup has to take
-    // the lock itself. Exists so self.ai can size a VRAM lease request for a
-    // model it is about to ask us to load: without a published figure, core has
-    // no way to ask the broker for the right amount and its only options are to
-    // guess or to skip the broker entirely -- which is self.ai#107.
-    footprint_info footprint_report(const server_model_meta & meta);
-
     // conv_id -> model tracker for the resumable stream routes, owns its lock
     conv_model_tracker conv_models;
 
@@ -373,6 +303,16 @@ public:
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
 
+    // downloads that never finished, with their sidecar kinds (thread-safe)
+    std::vector<server_unfinished_download> unfinished_downloads_get();
+
+    // drop a download that will never be resumed, its record and its partial files;
+    // throws for a name that is not recorded (thread-safe)
+    void unfinished_downloads_remove(const std::string & name);
+
+    // remove the sidecar `kind` of a model that is not in use, its files and partials (thread-safe)
+    bool remove_sidecar(const std::string & name, const std::string & kind);
+
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
 
@@ -380,9 +320,13 @@ public:
     std::vector<server_model_meta> get_all_meta();
 
     struct load_options {
-        server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
+        server_role_type role = SERVER_ROLE_INSTANCE;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
+        // download mode: the sidecar kinds pulled with the model, as -hf would, and
+        // the partial files the download plan writes
+        std::vector<std::string>             sidecars;
+        std::vector<common_download_partial> partials;
     };
 
     // load and unload model instances
@@ -397,6 +341,7 @@ public:
         int exit_code = 0; // only valid if status == UNLOADED
         json loaded_info = nullptr;
         json progress = nullptr;
+        std::optional<server_model_memory> memory = std::nullopt; // what the instance allocated, sent with READY
     };
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint
@@ -422,34 +367,22 @@ public:
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
+    // forward a websocket connection to the child, returns when either side closes
+    void proxy_ws(const server_http_req & req, server_http_context::ws_conn & conn, const std::string & name);
 
-    // handle message sent from server_child::notify_to_router()
+    // handle message sent from server_role::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
-    // this function is not thread-safe, must be called from instance's monitoring thread
+    // called from the monitor thread
     // payload per state:
     //     state = loading     -> payload = {} (TODO: add progress info)
-    //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
+    //     state = ready       -> payload = model_info (json) with a "memory" field, or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
+    //     state = measuring   -> payload = {result: "measured", min, max} or {result: "failed", error}
     void handle_child_state(const std::string & name, const std::string & raw_input);
-};
 
-struct server_child {
-    // serializes the notify_to_router writes
-    std::mutex mtx_stdout;
-    std::atomic<bool> is_finished_downloading = false; // set by run_download
-
-    // return true if the current process is a child server instance
-    bool is_child();
-    server_child_mode get_mode();
-    int run_download(common_params & params);
-
-    // register the shutdown_handler to be called by the router
-    // return the monitoring thread (to be joined by the caller)
-    std::thread setup(const std::function<void(int)> & shutdown_handler);
-
-    // notify router server for status changes (e.g. loading, downloading, sleeping, etc.)
-    // message will be handled by server_models::handle_child_state() on the router side
-    void notify_to_router(const std::string & state_name, const json & payload);
+private:
+    // one thread watching every child; keep last, the destructor joins the thread
+    std::unique_ptr<server_monitor> monitor;
 };
 
 struct server_models_routes {
@@ -477,6 +410,8 @@ struct server_models_routes {
     server_http_context::handler_t get_router_props;
     server_http_context::handler_t proxy_get;
     server_http_context::handler_t proxy_post;
+    server_http_context::ws_handler_t proxy_ws;
+
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;
